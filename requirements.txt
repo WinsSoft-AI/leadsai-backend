@@ -1,0 +1,83 @@
+
+# _*_ coding: utf-8 _*_
+# ═══════════════════════════════════════════════════════════════════════════════
+# Leads AI — Python Dependencies  v3.0
+# Install: pip install -r requirements.txt
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9           # file uploads
+websockets==12.0                  # WebSocket support
+
+
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+asyncpg==0.29.0                   # async PostgreSQL driver (replaces aiosqlite)
+
+
+
+# ── Environment / config ──────────────────────────────────────────────────────
+python-dotenv==1.0.1              # loads .env file — replaces config.py entirely
+
+
+
+# ── Auth / security ───────────────────────────────────────────────────────────
+PyJWT==2.8.0                      # JWT token creation and validation
+cryptography==42.0.8              # PyJWT RS256 backend (good to have)
+
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+pydantic>=2.7.0,<3.0.0
+pydantic-settings>=2.2.1         # only used if you add typed settings elsewhere
+email-validator==2.2.0            # EmailStr validation in Pydantic
+
+
+
+# ── AI / Gemini ───────────────────────────────────────────────────────────────
+httpx==0.27.0                     # async HTTP — used by GeminiClient
+google-generativeai==0.7.2        # optional: official SDK (GeminiClient uses raw HTTP)
+
+
+
+# ── Vector DB ─────────────────────────────────────────────────────────────────
+chromadb                          # RAG vector store
+# If you use CHROMA_MODE=http, also install on the server:
+#   pip install chromadb[server]
+
+
+
+# ── Document parsing ─────────────────────────────────────────────────────────
+# Document parsing is now handled by AI_Backend.
+# lxml and beautifulsoup4 are kept if explicitly needed for any local dashboard scraping, otherwise removed.
+# But for safety, keep standard light libs if they were used elsewhere.
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+
+
+# ── Media processing ────────────────────────────────────────────────────────────
+# STT, TTS, and CV logic moved to AI_Backend
+Pillow==10.4.0                    # image processing (kept for optional basic handling)
+
+
+
+# ── Payments ──────────────────────────────────────────────────────────────────
+razorpay==1.4.1
+
+
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+# Uses stdlib smtplib — no extra package needed
+
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dateutil==2.9.0
+aiofiles==24.1.0                  # async file I/O for static file serving
+
+boto3>=1.34  # AWS S3 client for file storage

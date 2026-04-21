@@ -1,0 +1,187 @@
+# =========================
+
+# Python
+
+# =========================
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# C extensions
+
+*.so
+
+# =========================
+
+# Virtual Environments
+
+# =========================
+
+.env
+.env.*
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# =========================
+
+# Environment Variables
+
+# =========================
+
+*.env
+*.env.local
+
+# =========================
+
+# Logs
+
+# =========================
+
+*.log
+logs/
+*.out
+
+# =========================
+
+# Database
+
+# =========================
+
+*.db
+*.sqlite3
+
+# =========================
+
+# FastAPI / Uvicorn
+
+# =========================
+
+*.pid
+*.reload
+
+# =========================
+
+# Testing
+
+# =========================
+
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# =========================
+
+# Type Checking / Lint
+
+# =========================
+
+.mypy_cache/
+.dmypy.json
+.pyre/
+.ruff_cache/
+
+# =========================
+
+# Build / Distribution
+
+# =========================
+
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================
+
+# Jupyter Notebooks
+
+# =========================
+
+.ipynb_checkpoints/
+
+# =========================
+
+# IDEs / Editors
+
+# =========================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+
+# OS Files
+
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+
+# Docker
+
+# =========================
+
+*.tar
+docker-compose.override.yml
+
+# =========================
+
+# ML / AI Artifacts (IMPORTANT for your project)
+
+# =========================
+
+# Models
+
+*.pt
+*.pth
+*.onnx
+*.h5
+
+# Vector DB / embeddings
+
+chroma_data/
+*.faiss
+
+# Data
+
+data/
+datasets/
+
+# =========================
+
+# Uploads / Temp Files
+
+# =========================
+
+uploads/
+tmp/
+temp/
+
+# =========================
+
+# AWS / Deployment
+
+# =========================
+
+.aws/
+*.pem
+
+# =========================
+
+# Misc
+
+# =========================
+
+*.bak
+*.tmp

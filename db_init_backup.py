@@ -35,7 +35,6 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from db import hash_password
 
 from dotenv import load_dotenv
 

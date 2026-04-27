@@ -176,7 +176,6 @@ PRODUCT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 LOGO_UPLOAD_DIR = UPLOAD_DIR / "logos"
 LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # BACKGROUND TASK — Auto-suspend expired trial tenants
 # ═════════════════════════════════════════════════════════════════════════════
@@ -225,7 +224,6 @@ async def _check_expired_trials():
 
         await asyncio.sleep(6 * 3600)  # Run every 6 hours
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # LIFESPAN
 # ═════════════════════════════════════════════════════════════════════════════
@@ -258,7 +256,6 @@ async def lifespan(app: FastAPI):
     await app.state.ai.close()
     await close_pool()
 
-
 app = FastAPI(
     title="Leads AI API",
     version="3.1.0",
@@ -279,7 +276,6 @@ app.include_router(auth_router)
 if os.getenv("DEV_MODE", "false").lower() == "true":
     app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 app.mount("/widget", StaticFiles(directory=str(WIDGET_DIR)), name="widget")
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TOKEN METERING HELPER
@@ -303,7 +299,6 @@ async def _meter_tokens(tenant_id: str, input_tokens: int, output_tokens: int):
     except Exception as e:
         logger.warning(f"Token metering failed for tenant {tenant_id}: {e}")
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # DOMAIN-BASED AUTH  (widget endpoints)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -314,7 +309,6 @@ _DASHBOARD_ORIGINS = [
     os.getenv("DASHBOARD_ORIGINS", "http://localhost:5173,http://localhost:3000,http://localhost:8000").split(",")
     if o.strip()
 ]
-
 
 def _extract_domain(request: Request) -> str:
     """
@@ -328,7 +322,6 @@ def _extract_domain(request: Request) -> str:
     origin = origin.split("://")[-1].split("/")[0]
     # Strip port if present
     return origin.split(":")[0].lower()
-
 
 # Known secondary TLD components (appear before the country code)
 _SUB_TLDS = {"co", "com", "net", "org", "ac", "gov", "edu", "gen", "firm", "ind", "nic", "res"}
@@ -354,7 +347,6 @@ def _extract_sld(domain: str) -> str:
         return parts[-3] if len(parts) >= 3 else parts[0]
     return parts[-2]
 
-
 def _domain_matches(registered_domain: str, request_origin: str) -> bool:
     """
     Check if a request origin belongs to the same brand as the registered domain.
@@ -373,8 +365,6 @@ def _domain_matches(registered_domain: str, request_origin: str) -> bool:
     if not reg_sld or not req_sld:
         return False
     return reg_sld == req_sld
-
-
 
 import jwt as pyjwt
 from datetime import datetime, timedelta, timezone
@@ -449,8 +439,7 @@ async def verify_widget_jwt(request: Request) -> Dict:
     return tenant_config
 
 async def _get_tenant_config(tenant_id: str) -> Dict:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tenant_id) as conn:
         row = await conn.fetchrow(
             """
             SELECT t.id AS tenant_id,
@@ -500,10 +489,8 @@ async def _get_tenant_config(tenant_id: str) -> Dict:
             "proactive_message":  row.get("proactive_message") or "Hi there! Need help? Chat with us!",
         }
 
-
 # ── Widget secret rotation interval (days) ────────────────────────────────────
 _WIDGET_SECRET_ROTATION_DAYS = int(os.getenv("WIDGET_SECRET_ROTATION_DAYS", "30"))
-
 
 async def _rotate_widget_secret_bg(tenant_id: str):
     """Background task: rotate a tenant's widget_secret without blocking the response."""
@@ -518,7 +505,6 @@ async def _rotate_widget_secret_bg(tenant_id: str):
         logger.info(f"🔄 Widget secret rotated for tenant {tenant_id}")
     except Exception as e:
         logger.error(f"Widget secret rotation failed for {tenant_id}: {e}")
-
 
 async def _alert_bypass_attempt(slug: str, origin: str, tenant_id: str, tenant_domain: str):
     """Background task: email superadmin about a widget bypass attempt."""
@@ -562,7 +548,6 @@ async def _alert_bypass_attempt(slug: str, origin: str, tenant_id: str, tenant_d
         logger.warning(f"🚨 Bypass alert sent: slug={slug}, origin={origin}, tenant={tenant_id}")
     except Exception as e:
         logger.error(f"Bypass alert failed: {e}")
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # WIDGET  (JWT Auth via slug)
@@ -655,7 +640,6 @@ async def get_widget_config(request: Request, slug: str = None):
     cfg = await _get_tenant_config(tenant_id)
     return cfg
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
@@ -664,20 +648,17 @@ def _must_be_user(current: dict) -> None:
     if current.get("account_type") != "user":
         raise HTTPException(status_code=403, detail="Requires a tenant account")
 
-
 def _must_be_owner(current: dict) -> None:
     """Owner-only: widget config, embed, settings, billing."""
     _must_be_user(current)
     if current.get("role") != "owner":
         raise HTTPException(status_code=403, detail="Owner access required")
 
-
 def _must_be_owner_or_member(current: dict) -> None:
     """Owner + member: knowledge base, tickets, ingest, leads follow-up."""
     _must_be_user(current)
     if current.get("role") not in ("owner", "member"):
         raise HTTPException(status_code=403, detail="Owner or member access required")
-
 
 def _must_not_be_suspended(current: dict) -> None:
     """Block dashboard mutations for suspended tenants. Ticket + billing routes are exempt."""
@@ -687,15 +668,11 @@ def _must_not_be_suspended(current: dict) -> None:
             detail="Your account is suspended. Please upgrade or contact support.",
         )
 
-
 def _must_not_be_trial(current: dict, feature: str = "") -> None:
     """Block certain mutations for trial plan users."""
     if current.get("plan") == "trial":
         msg = f"Upgrade your plan to use {feature}." if feature else "This feature requires a paid plan."
         raise HTTPException(status_code=403, detail=msg)
-
-
-
 
 def _build_where(filters: list[tuple[Any, str]]) -> tuple[str, list]:
     """
@@ -710,7 +687,6 @@ def _build_where(filters: list[tuple[Any, str]]) -> tuple[str, list]:
             params.append(val)
             conds.append(frag.replace("$N", f"${len(params)}"))
     return " AND ".join(conds), params
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PUBLIC
@@ -744,7 +720,6 @@ async def system_info():
         "ai_backend": ai_info,
     }
 
-
 @app.get("/v1/plans", tags=["Payments"])
 async def list_plans():
     pool = await get_pool()
@@ -771,7 +746,6 @@ async def list_plans():
             }
             for row in rows
         }
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # WIDGET  (JWT Auth via slug)
@@ -864,7 +838,6 @@ async def get_widget_config(request: Request, slug: str = None):
         "proactive_message":  tenant.get("proactive_message"),
     }
 
-
 # ── Session metadata helpers ─────────────────────────────────────────────────
 import re as _re
 
@@ -925,7 +898,6 @@ def _parse_user_agent(ua: str) -> dict:
         "device_type": device_type,
     }
 
-
 async def _geolocate_ip(ip: str) -> dict:
     """Best-effort IP geolocation via ip-api.com (free, no key needed)."""
     geo = {"country": None, "city": None, "region": None, "timezone": None}
@@ -945,7 +917,6 @@ async def _geolocate_ip(ip: str) -> dict:
         pass  # non-critical, skip silently
     return geo
 
-
 async def _capture_session_metadata(
     session_id: str, tenant_id: str,
     request: Request, req: "ChatRequest",
@@ -953,8 +924,7 @@ async def _capture_session_metadata(
     """Insert session_metadata row on the very first message of a session.
     Runs in background — failures are logged but never block chat."""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async with tenant_conn(tenant_id) as conn:
             # Skip if already captured
             exists = await conn.fetchval(
                 "SELECT 1 FROM session_metadata WHERE session_id=$1", session_id
@@ -988,7 +958,6 @@ async def _capture_session_metadata(
             )
     except Exception as e:
         logger.warning(f"Session metadata capture failed: {e}")
-
 
 @app.post("/v1/chat", response_model=ChatResponse, tags=["Widget"])
 async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, tenant=Depends(verify_widget_jwt)):
@@ -1052,8 +1021,7 @@ async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, te
             if isinstance(c, dict) and str(c.get("source", "")).startswith("Product")
         ]
         if product_sources and not is_fallback:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
+            async with tenant_conn(tenant_id) as conn:
                 for src in product_sources[:4]:
                     src_name = str(src.get("source", ""))
                     prod_name = src_name.replace("Product - ", "").replace("Product -", "").strip()
@@ -1085,9 +1053,8 @@ async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, te
 
     # ── Persist session to DB (incremental upsert) ──
     try:
-        pool = await get_pool()
         visitor_id = req.session_id.split("_")[0] if "_" in req.session_id else "visitor"
-        async with pool.acquire() as conn:
+        async with tenant_conn(tenant_id) as conn:
             await conn.execute(
                 "INSERT INTO sessions (id, tenant_id, visitor_id, language, message_count, "
                 "pii_collected, chat_history, last_active) "
@@ -1112,11 +1079,9 @@ async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, te
         suggested_products=products,
     )
 
-
 class _TestChatReq(BaseModel):
     message: str
     session_id: str = ""
-
 
 @app.post("/v1/chat/test", tags=["Dashboard"])
 async def chat_test(req: _TestChatReq, current: dict = Depends(get_current_user)):
@@ -1125,8 +1090,7 @@ async def chat_test(req: _TestChatReq, current: dict = Depends(get_current_user)
     tid = current["tenant_id"]
 
     # Load tenant config for Gemini prompt context
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tenant_id) as conn:
         tenant_row = await conn.fetchrow(
             "SELECT t.*, wc.greeting, wc.primary_color, wc.name AS widget_name "
             "FROM tenants t LEFT JOIN widget_configs wc ON wc.tenant_id = t.id "
@@ -1164,7 +1128,6 @@ async def chat_test(req: _TestChatReq, current: dict = Depends(get_current_user)
         "sources": result.get("sources", []),
     }
 
-
 @app.post("/v1/cv-search", tags=["Widget"])
 async def cv_search(
     file: UploadFile = File(...),
@@ -1177,13 +1140,11 @@ async def cv_search(
     )
     return {"matches": matches, "session_id": session_id}
 
-
 @app.post("/v1/behavior", tags=["Widget"])
 async def track_behavior(event: BehaviorEvent, tenant=Depends(verify_widget_jwt)):
     return await app.state.ai.behavior_process(
         event_dict=event.dict(), tenant_id=tenant["id"]
     )
-
 
 @app.post("/v1/lead", tags=["Widget"])
 async def capture_lead(lead: LeadCapture, tenant=Depends(verify_widget_jwt)):
@@ -1194,9 +1155,8 @@ async def capture_lead(lead: LeadCapture, tenant=Depends(verify_widget_jwt)):
 
     # Persist PII flag to DB session row
     try:
-        pool = await get_pool()
         visitor_id = lead.session_id.split("_")[0] if "_" in lead.session_id else "visitor"
-        async with pool.acquire() as conn:
+        async with tenant_conn(tenant_id) as conn:
             await conn.execute(
                 "INSERT INTO sessions (id, tenant_id, visitor_id, pii_collected, last_active) "
                 "VALUES ($1, $2, $3, TRUE, NOW()) "
@@ -1211,7 +1171,6 @@ async def capture_lead(lead: LeadCapture, tenant=Depends(verify_widget_jwt)):
         pii={"name": lead.name, "email": lead.email, "phone": lead.phone},
     )
     return {"lead_id": lead_id, "status": "captured"}
-
 
 async def _process_closed_session(session_id: str, session: dict, tenant: dict, history: list):
     # 1. Analyze intent via Gemini
@@ -1231,9 +1190,8 @@ async def _process_closed_session(session_id: str, session: dict, tenant: dict, 
 
     # 2. Persist full session to DB
     try:
-        pool = await get_pool()
         visitor_id = session_id.split("_")[0] if "_" in session_id else "visitor"
-        async with pool.acquire() as conn:
+        async with tenant_conn(tenant_id) as conn:
             async with conn.transaction():
                 await conn.execute(
                     "INSERT INTO sessions (id, tenant_id, visitor_id, language, message_count, "
@@ -1348,8 +1306,7 @@ async def _process_closed_session(session_id: str, session: dict, tenant: dict, 
     try:
         visitor_name = pii.get("name", "").strip() if pii else ""
         if visitor_name:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
+            async with tenant_conn(tenant_id) as conn:
                 await conn.execute(
                     "UPDATE session_metadata SET visitor_name=$1 WHERE session_id=$2",
                     visitor_name, session_id,
@@ -1368,7 +1325,6 @@ async def _process_closed_session(session_id: str, session: dict, tenant: dict, 
 
     await app.state.sessions.delete(session_id)
 
-
 @app.post("/v1/session/close", tags=["Widget"])
 async def close_session(session_id: str, bg_tasks: BackgroundTasks, tenant=Depends(verify_widget_jwt)):
     session = await app.state.sessions.get_or_create(session_id, tenant["id"])
@@ -1379,7 +1335,6 @@ async def close_session(session_id: str, bg_tasks: BackgroundTasks, tenant=Depen
     # Discard non-blocking heavy ops to background
     bg_tasks.add_task(_process_closed_session, session_id, session, tenant, history)
     return {"status": "queued"}
-
 
 @app.post("/v1/ingest", tags=["Widget"])
 async def ingest_document(file: UploadFile = File(...), current: dict = Depends(get_current_user)):
@@ -1393,12 +1348,10 @@ async def ingest_document(file: UploadFile = File(...), current: dict = Depends(
     )
     return {"job_id": job_id, "status": "processing", "filename": file.filename}
 
-
 @app.get("/v1/ingest/{job_id}", tags=["Widget"])
 async def ingest_status(job_id: str, current: dict = Depends(get_current_user)):
     _must_be_user(current)
     return await app.state.ai.rag_get_job_status(job_id)
-
 
 # ── WebSocket Managers ────────────────────────────────────────────────────────
 class TicketConnectionManager:
@@ -1432,12 +1385,10 @@ class TicketConnectionManager:
 
 ticket_manager = TicketConnectionManager()
 
-
 # ── Short-lived WS token endpoints ────────────────────────────────────────────
 import jwt as pyjwt
 _WS_SECRET = os.environ.get("SECRET_KEY", "change-me")
 _WS_TOKEN_TTL = 30  # seconds
-
 
 @app.post("/v1/ws/voice-token", tags=["Widget"])
 async def create_voice_ws_token(tenant=Depends(verify_widget_jwt)):
@@ -1452,7 +1403,6 @@ async def create_voice_ws_token(tenant=Depends(verify_widget_jwt)):
     token = pyjwt.encode(payload, _WS_SECRET, algorithm="HS256")
     return {"ws_token": token}
 
-
 @app.post("/v1/ws/ticket-token", tags=["Tickets"])
 async def create_ticket_ws_token(current: dict = Depends(get_current_user)):
     """Mint a short-lived token (30s) for WebSocket ticket connection."""
@@ -1466,7 +1416,6 @@ async def create_ticket_ws_token(current: dict = Depends(get_current_user)):
     }
     token = pyjwt.encode(payload, _WS_SECRET, algorithm="HS256")
     return {"ws_token": token}
-
 
 @app.websocket("/ws/voice/{session_id}")
 async def voice_ws(websocket: WebSocket, session_id: str, token: str = Query(...)):
@@ -1540,7 +1489,6 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = Query(...
     except asyncio.TimeoutError:
         await websocket.close(code=1001)
 
-
 @app.post("/v1/stt", tags=["Widget"])
 async def stt_transcribe(body: dict, tenant=Depends(verify_widget_jwt)):
     """
@@ -1591,8 +1539,7 @@ async def get_analytics(
         start_dt = now - timedelta(days=days)
         end_dt = now
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         daily = await conn.fetch(
             "SELECT DATE(s.started_at) AS day,"
             "       COUNT(DISTINCT s.id) AS sessions,"
@@ -1665,18 +1612,15 @@ async def get_analytics(
         "recent_leads":      [dict(r) for r in recent_leads],
     }
 
-
 @app.get("/v1/leads/intents", tags=["Dashboard"])
 async def get_lead_intents(current: dict = Depends(get_current_user)):
     _must_be_user(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         rows = await conn.fetch(
             "SELECT DISTINCT intent FROM leads WHERE tenant_id=$1 AND intent IS NOT NULL ORDER BY intent",
             current["tenant_id"]
         )
     return [r["intent"] for r in rows]
-
 
 @app.get("/v1/leads", tags=["Dashboard"])
 async def get_leads(
@@ -1692,7 +1636,7 @@ async def get_leads(
     _must_be_user(current)
     pool   = await get_pool()
     offset = (page - 1) * limit
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         conds:  list[str] = ["l.tenant_id=$1"]
         params: list      = [current["tenant_id"]]
         if filter == "anon":
@@ -1723,12 +1667,10 @@ async def get_leads(
         total = await conn.fetchval(f"SELECT COUNT(*) FROM leads l WHERE {where}", *params)
     return {"leads": [dict(r) for r in rows], "total": total, "page": page}
 
-
 @app.get("/v1/leads/{lead_id}/conversation", tags=["Dashboard"])
 async def lead_conversation(lead_id: str, current: dict = Depends(get_current_user)):
     _must_be_user(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         row = await conn.fetchrow(
             "SELECT * FROM leads WHERE id=$1 AND tenant_id=$2",
             lead_id, current["tenant_id"],
@@ -1795,27 +1737,23 @@ async def lead_conversation(lead_id: str, current: dict = Depends(get_current_us
         "merged_sessions": merged_sessions,
     }
 
-
 @app.get("/v1/knowledge/list", tags=["Dashboard"])
 async def list_knowledge(current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         rows = await conn.fetch(
             "SELECT * FROM ingest_jobs WHERE tenant_id=$1 ORDER BY created_at DESC",
             current["tenant_id"],
         )
     return {"docs": [dict(r) for r in rows]}
 
-
 @app.get("/v1/knowledge/status", tags=["Dashboard"])
 async def get_knowledge_status(current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
-    pool = await get_pool()
     
     # 1. Check SQL metadata
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         row = await conn.fetchrow(
             "SELECT COUNT(*) as doc_count, SUM(chunks_indexed) as sql_chunks "
             "FROM ingest_jobs WHERE tenant_id=$1 AND status='completed'",
@@ -1852,25 +1790,21 @@ async def get_knowledge_status(current: dict = Depends(get_current_user)):
         "backend_status": ai_status
     }
 
-
 @app.get("/v1/knowledge/qa", tags=["Dashboard"])
 async def list_qa(current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         rows = await conn.fetch(
             "SELECT * FROM knowledge_qa WHERE tenant_id=$1 ORDER BY created_at DESC",
             current["tenant_id"],
         )
     return {"qa": [dict(r) for r in rows]}
 
-
 @app.post("/v1/knowledge/qa", tags=["Dashboard"])
 async def add_qa(req: KnowledgeQACreate, current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    pool = await get_pool()
     qa_id = secrets.token_hex(8)
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         async with conn.transaction():
             await conn.execute(
                 "INSERT INTO knowledge_qa (id, tenant_id, question, answer) VALUES ($1, $2, $3, $4)",
@@ -1889,12 +1823,10 @@ async def add_qa(req: KnowledgeQACreate, current: dict = Depends(get_current_use
 
     return {"id": qa_id, "status": "created"}
 
-
 @app.delete("/v1/knowledge/qa/{qa_id}", tags=["Dashboard"])
 async def delete_qa(qa_id: str, current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         # verify ownership
         row = await conn.fetchrow(
             "SELECT id FROM knowledge_qa WHERE id=$1 AND tenant_id=$2",
@@ -1915,12 +1847,10 @@ async def delete_qa(qa_id: str, current: dict = Depends(get_current_user)):
 
     return {"status": "deleted"}
 
-
 @app.delete("/v1/knowledge/{doc_id}", tags=["Dashboard"])
 async def delete_document(doc_id: str, current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         row = await conn.fetchrow(
             "SELECT id FROM ingest_jobs WHERE id=$1 AND tenant_id=$2",
             doc_id, current["tenant_id"],
@@ -1938,7 +1868,6 @@ async def delete_document(doc_id: str, current: dict = Depends(get_current_user)
 
     return {"status": "deleted", "doc_id": doc_id}
 
-
 # ── Web Scraping ───────────────────────────────────────────────────────────────
 
 import ipaddress as _ipaddress
@@ -1946,7 +1875,6 @@ import socket as _socket
 from urllib.parse import urlparse as _urlparse
 
 _BLOCKED_PORTS = {22, 3306, 5432, 6379, 27017}
-
 
 def _validate_domain(domain: str) -> str:
     """Reject private/loopback/reserved IPs (SSRF protection) for tenant domain field."""
@@ -1973,7 +1901,6 @@ def _validate_domain(domain: str) -> str:
     except Exception:
         raise HTTPException(400, "Could not resolve domain hostname")
     return domain.strip()
-
 
 # ── Structured Knowledge Base ──────────────────────────────────────────────────
 # Company data + Product catalog + Vector sync
@@ -2009,20 +1936,17 @@ _KB_SECTIONS = {
     ],
 }
 
-
 @app.get("/v1/kb/sections", tags=["Dashboard"])
 async def kb_section_definitions():
     """Return the field definitions for company data sections (used by frontend)."""
     return {"sections": _KB_SECTIONS}
-
 
 @app.get("/v1/kb/company", tags=["Dashboard"])
 async def kb_get_company(current: dict = Depends(get_current_user)):
     """Fetch all company data fields for the current tenant."""
     _must_be_user(current)
     tid = current["tenant_id"]
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         rows = await conn.fetch(
             "SELECT id, section, field_key, field_value, display_order "
             "FROM kb_company_data WHERE tenant_id=$1 ORDER BY section, display_order",
@@ -2030,15 +1954,13 @@ async def kb_get_company(current: dict = Depends(get_current_user)):
         )
     return {"data": [dict(r) for r in rows], "sections": _KB_SECTIONS}
 
-
 @app.put("/v1/kb/company", tags=["Dashboard"])
 async def kb_update_company(req: CompanyDataUpdate, current: dict = Depends(get_current_user)):
     """Batch upsert company data fields. Each item: {section, field_key, field_value}."""
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
-    pool = await get_pool()
 
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         async with conn.transaction():
             for idx, item in enumerate(req.data):
                 # Validate section
@@ -2053,7 +1975,6 @@ async def kb_update_company(req: CompanyDataUpdate, current: dict = Depends(get_
                     row_id, tid, item.section, item.field_key, item.field_value, idx,
                 )
     return {"status": "saved", "count": len(req.data)}
-
 
 @app.get("/v1/kb/product-template", tags=["Dashboard"])
 async def kb_get_product_template(current: dict = Depends(get_current_user)):
@@ -2081,14 +2002,12 @@ async def kb_get_product_template(current: dict = Depends(get_current_user)):
         columns = default
     return {"columns": columns}
 
-
 @app.get("/v1/kb/products", tags=["Dashboard"])
 async def kb_list_products(current: dict = Depends(get_current_user)):
     """List all products for the current tenant."""
     _must_be_user(current)
     tid = current["tenant_id"]
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         rows = await conn.fetch(
             "SELECT * FROM kb_products WHERE tenant_id=$1 ORDER BY category, name", tid,
         )
@@ -2098,15 +2017,13 @@ async def kb_list_products(current: dict = Depends(get_current_user)):
             p["image_url"] = app.state.s3.resolve_url(p["image_url"])
     return {"products": products}
 
-
 @app.post("/v1/kb/products", status_code=201, tags=["Dashboard"])
 async def kb_create_product(req: ProductCreate, current: dict = Depends(get_current_user)):
     """Create a new product entry."""
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
     pid = secrets.token_hex(8)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         await conn.execute(
             "INSERT INTO kb_products (id, tenant_id, category, sub_category, name, description, "
             "image_url, pricing, min_order_qty, source_url) "
@@ -2116,15 +2033,13 @@ async def kb_create_product(req: ProductCreate, current: dict = Depends(get_curr
         )
     return {"id": pid, "status": "created"}
 
-
 @app.put("/v1/kb/products/{product_id}", tags=["Dashboard"])
 async def kb_update_product(product_id: str, req: ProductUpdate, current: dict = Depends(get_current_user)):
     """Update an existing product."""
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
-    pool = await get_pool()
 
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         existing = await conn.fetchrow(
             "SELECT id, image_url FROM kb_products WHERE id=$1 AND tenant_id=$2", product_id, tid,
         )
@@ -2155,14 +2070,12 @@ async def kb_update_product(product_id: str, req: ProductUpdate, current: dict =
 
     return {"status": "updated"}
 
-
 @app.delete("/v1/kb/products/{product_id}", tags=["Dashboard"])
 async def kb_delete_product(product_id: str, current: dict = Depends(get_current_user)):
     """Delete a product."""
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         row = await conn.fetchrow(
             "SELECT id, image_url FROM kb_products WHERE id=$1 AND tenant_id=$2", product_id, tid,
         )
@@ -2173,7 +2086,6 @@ async def kb_delete_product(product_id: str, current: dict = Depends(get_current
             key = row["image_url"].split("/v1/assets?key=")[-1]
             await app.state.s3.delete(key)
     return {"status": "deleted"}
-
 
 @app.post("/v1/kb/products/upload-image", tags=["Dashboard"])
 async def kb_upload_product_image(
@@ -2236,18 +2148,16 @@ async def kb_scrape_product_url(
         "product": enriched,
     }
 
-
 @app.post("/v1/kb/sync", tags=["Dashboard"])
 async def kb_sync_vectors(current: dict = Depends(get_current_user)):
     """Trigger a vector DB rebuild for the tenant's structured KB data."""
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
-    pool = await get_pool()
 
     import hashlib
     chunks = []
 
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         # 1. Company data → one chunk per section
         company_rows = await conn.fetch(
             "SELECT section, field_key, field_value FROM kb_company_data "
@@ -2296,7 +2206,6 @@ async def kb_sync_vectors(current: dict = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(502, f"Vector sync failed: {e}")
 
-
 # ── Domain verification ───────────────────────────────────────────────────────
 
 @app.post("/v1/verify-domain", tags=["Dashboard"])
@@ -2343,8 +2252,6 @@ async def verify_domain(current: dict = Depends(get_current_user)):
     except Exception as e:
         return {"status": "error", "message": str(e), "token": token}
 
-
-
 # ── Widget config ──────────────────────────────────────────────────────────────
 class _WidgetUpdate(BaseModel):
     name:               Optional[str]  = None
@@ -2368,12 +2275,10 @@ class _WidgetUpdate(BaseModel):
     notification_email: Optional[str]  = None
     languages:          Optional[str]  = None
 
-
 @app.get("/v1/widget-config", tags=["Dashboard"])
 async def get_widget_config_dashboard(current: dict = Depends(get_current_user)):
     _must_be_owner(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         row = await conn.fetchrow(
             "SELECT wc.* FROM widget_configs wc WHERE wc.tenant_id=$1",
             current["tenant_id"],
@@ -2385,7 +2290,6 @@ async def get_widget_config_dashboard(current: dict = Depends(get_current_user))
         result["bg_image_url"] = app.state.s3.resolve_url(result["bg_image_url"])
     return result
 
-
 @app.put("/v1/widget-config", tags=["Dashboard"])
 async def update_widget_config(body: _WidgetUpdate, current: dict = Depends(get_current_user)):
     _must_be_owner(current)
@@ -2396,7 +2300,7 @@ async def update_widget_config(body: _WidgetUpdate, current: dict = Depends(get_
         raise HTTPException(status_code=400, detail="No fields provided")
         
     pool   = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         # Check old URLs to delete if replaced or cleared
         if "logo_url" in updates or "bg_image_url" in updates:
             existing = await conn.fetchrow(
@@ -2475,9 +2379,8 @@ async def get_widget_embed(request: Request, current: dict = Depends(get_current
     """
     _must_be_owner(current)
     tid  = current["tenant_id"]
-    pool = await get_pool()
 
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         cfg = await conn.fetchrow(
             "SELECT wc.*, t.name AS business_name, t.plan, t.widget_slug"
             " FROM widget_configs wc"
@@ -2537,8 +2440,6 @@ async def get_widget_embed(request: Request, current: dict = Depends(get_current
         "install_guide":      install_guide,
     }
 
-
-
 # ── Usage / subscription / payments ───────────────────────────────────────────
 @app.get("/v1/usage", tags=["Dashboard"])
 async def get_usage(days: int = 30, current: dict = Depends(get_current_user)):
@@ -2547,18 +2448,15 @@ async def get_usage(days: int = 30, current: dict = Depends(get_current_user)):
     usage     = await app.state.payments.check_usage(current["tenant_id"])
     return {**usage, "analytics": analytics}
 
-
 @app.get("/v1/subscription", tags=["Dashboard"])
 async def get_subscription(current: dict = Depends(get_current_user)):
     _must_be_user(current)
     return await app.state.payments.check_usage(current["tenant_id"])
 
-
 @app.get("/v1/payment/history", tags=["Dashboard"])
 async def payment_history(current: dict = Depends(get_current_user)):
     _must_be_user(current)
     return {"payments": await app.state.payments.get_payment_history(current["tenant_id"])}
-
 
 class _OrderReq(BaseModel):
     name:    str
@@ -2567,7 +2465,6 @@ class _OrderReq(BaseModel):
     phone:   str = ""
     plan:    str = "pro"
 
-
 class _VerifyReq(BaseModel):
     razorpay_order_id:   str
     razorpay_payment_id: str
@@ -2575,14 +2472,12 @@ class _VerifyReq(BaseModel):
     tenant_id:           str
     plan:                str
 
-
 @app.post("/v1/payment/create-order", tags=["Payments"])
 async def create_order(req: _OrderReq):
     cfg = await get_plan(req.plan)
     if not cfg:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {req.plan}")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         row = await conn.fetchrow("SELECT id FROM tenants WHERE email=$1", req.email)
         if row:
             tid = row["id"]
@@ -2604,7 +2499,6 @@ async def create_order(req: _OrderReq):
     order["tenant_id"] = tid
     return order
 
-
 @app.post("/v1/payment/verify", tags=["Payments"])
 async def verify_payment(req: _VerifyReq):
     return await app.state.payments.verify_payment(
@@ -2615,7 +2509,6 @@ async def verify_payment(req: _VerifyReq):
         plan=req.plan,
     )
     # Note: audit for payment_verified is logged inside payments.verify_payment
-
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 class _SettingsUpdate(BaseModel):
@@ -2632,12 +2525,10 @@ class _SettingsUpdate(BaseModel):
 # In-memory email-change OTP store: { "user_id": {"otp": "123456", "email": "new@x.com", "expires": float} }
 _email_otps: dict[str, dict] = {}
 
-
 @app.get("/v1/settings", tags=["Dashboard"])
 async def get_settings(current: dict = Depends(get_current_user)):
     _must_be_user(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         tenant = await conn.fetchrow(
             "SELECT name, email, company, phone, country_code, domain, logo_url, plan, status,"
             " notification_emails, created_at FROM tenants WHERE id=$1",
@@ -2683,13 +2574,11 @@ async def get_settings(current: dict = Depends(get_current_user)):
         } if sub else None,
     }
 
-
 @app.put("/v1/settings", tags=["Dashboard"])
 async def update_settings(body: _SettingsUpdate, current: dict = Depends(get_current_user)):
     _must_be_user(current)
     _must_not_be_suspended(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         async with conn.transaction():
             # Update user name (any role can update their own name)
             if body.name:
@@ -2748,7 +2637,6 @@ async def update_settings(body: _SettingsUpdate, current: dict = Depends(get_cur
                          body.model_dump(exclude_none=True), tenant_id=current["tenant_id"])
     return {"status": "updated"}
 
-
 @app.post("/v1/settings/logo", tags=["Dashboard"])
 async def upload_tenant_logo(
     file: UploadFile = File(...),
@@ -2779,8 +2667,7 @@ async def upload_tenant_logo(
         cache_control="public, max-age=300"
     )
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         async with conn.transaction():
             await conn.execute(
                 "UPDATE tenants SET logo_url=$1, updated_at=NOW() WHERE id=$2",
@@ -2793,14 +2680,11 @@ async def upload_tenant_logo(
             
     return {"logo_url": app.state.s3.resolve_url(actual_key)}
 
-
 class _EmailOTPReq(BaseModel):
     new_email: str
 
-
 class _EmailOTPVerify(BaseModel):
     otp: str
-
 
 @app.post("/v1/settings/request-email-otp", tags=["Dashboard"])
 async def request_email_otp(body: _EmailOTPReq, current: dict = Depends(get_current_user)):
@@ -2815,7 +2699,6 @@ async def request_email_otp(body: _EmailOTPReq, current: dict = Depends(get_curr
     }
     logger.info(f"Email OTP for user {current['id']}: {otp} (dev mode)")
     return {"message": "OTP sent to new email"}
-
 
 @app.post("/v1/settings/verify-email-otp", tags=["Dashboard"])
 async def verify_email_otp(body: _EmailOTPVerify, current: dict = Depends(get_current_user)):
@@ -2848,7 +2731,6 @@ async def verify_email_otp(body: _EmailOTPVerify, current: dict = Depends(get_cu
         )
     return {"status": "email_updated", "new_email": new_email}
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # MEMBERS — TEAM MANAGEMENT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2856,7 +2738,6 @@ MAX_OWNERS = 3  # max 3 owners per tenant
 
 # In-memory OTP store: { "tenant:member_id": {"otp": "123456", "expires": float} }
 _owner_otps: dict[str, dict] = {}
-
 
 class _MemberCreate(BaseModel):
     name:     str
@@ -2866,11 +2747,9 @@ class _MemberCreate(BaseModel):
     country_code: str = "+91"
     role:     str = "member"  # member
 
-
 class _MemberUpdate(BaseModel):
     role:   Optional[str] = None   # owner | member
     status: Optional[str] = None   # active | inactive
-
 
 @app.get("/v1/members", tags=["Members"])
 async def list_members(current: dict = Depends(get_current_user)):
@@ -2891,7 +2770,6 @@ async def list_members(current: dict = Depends(get_current_user)):
             m.pop("status", None)
             m.pop("last_active", None)
     return {"members": members, "max_owners": MAX_OWNERS}
-
 
 @app.post("/v1/members", status_code=201, tags=["Members"])
 async def add_member(body: _MemberCreate, current: dict = Depends(get_current_user)):
@@ -2918,13 +2796,11 @@ async def add_member(body: _MemberCreate, current: dict = Depends(get_current_us
     return {"id": mid, "name": body.name, "email": body.email, "role": body.role,
             "phone": body.phone, "country_code": body.country_code}
 
-
 @app.put("/v1/members/{member_id}", tags=["Members"])
 async def update_member(member_id: str, body: _MemberUpdate,
                         current: dict = Depends(get_current_user)):
     _must_be_owner(current)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(tid) as conn:
         row = await conn.fetchrow(
             "SELECT id, role FROM user_auth WHERE id=$1 AND tenant_id=$2",
             member_id, current["tenant_id"],
@@ -2983,7 +2859,6 @@ async def contact_sales(body: ContactSalesRequest, current: dict = Depends(get_c
         logger.error(f"Contact sales error: {e}")
         raise HTTPException(status_code=500, detail="Failed to send inquiry.")
 
-
 @app.post("/v1/members/{member_id}/request-owner-otp", tags=["Members"])
 async def request_owner_otp(member_id: str, current: dict = Depends(get_current_user)):
     """Send OTP to current owner's email to confirm owner promotion."""
@@ -3030,7 +2905,6 @@ async def request_owner_otp(member_id: str, current: dict = Depends(get_current_
     )
     return {"status": "otp_sent", "message": "OTP sent to your email"}
 
-
 @app.post("/v1/members/{member_id}/confirm-owner", tags=["Members"])
 async def confirm_owner_promotion(
     member_id: str,
@@ -3068,7 +2942,6 @@ async def confirm_owner_promotion(
         )
     return {"status": "promoted", "member_id": member_id, "role": "owner"}
 
-
 @app.delete("/v1/members/{member_id}", tags=["Members"])
 async def remove_member(member_id: str, current: dict = Depends(get_current_user)):
     _must_be_owner(current)
@@ -3083,7 +2956,6 @@ async def remove_member(member_id: str, current: dict = Depends(get_current_user
     if res == "DELETE 0":
         raise HTTPException(status_code=404, detail="Member not found")
     return {"status": "removed", "member_id": member_id}
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TICKETS — USER SIDE
@@ -3127,7 +2999,6 @@ async def user_list_tickets(
             f"SELECT COUNT(*) FROM tickets t WHERE {where}", *params
         )
     return {"tickets": [dict(r) for r in rows], "total": total, "page": page}
-
 
 @app.post("/v1/tickets", status_code=201, tags=["Tickets"])
 async def user_create_ticket(
@@ -3195,7 +3066,6 @@ async def user_create_ticket(
                          tenant_id=current["tenant_id"])
     return {"ticket_id": tid, "status": "open"}
 
-
 @app.get("/v1/tickets/{ticket_id}", tags=["Tickets"])
 async def user_get_ticket(ticket_id: str, current: dict = Depends(get_current_user)):
     _must_be_user(current)
@@ -3251,7 +3121,6 @@ async def download_ticket_attachment(ticket_id: str, attachment_id: str, current
         url = app.state.s3.get_url(row["file_path"], expires_in=3600)
         return RedirectResponse(url, status_code=302)
 
-
 @app.get("/v1/tickets/{ticket_id}/messages", tags=["Tickets"])
 async def user_get_messages(ticket_id: str, current: dict = Depends(get_current_user)):
     _must_be_user(current)
@@ -3273,7 +3142,6 @@ async def user_get_messages(ticket_id: str, current: dict = Depends(get_current_
             ticket_id,
         )
     return {"messages": [dict(m) for m in msgs]}
-
 
 @app.websocket("/ws/tickets/{ticket_id}")
 async def ticket_ws(websocket: WebSocket, ticket_id: str, token: str = Query(...)):
@@ -3422,10 +3290,8 @@ async def ticket_ws(websocket: WebSocket, ticket_id: str, token: str = Query(...
             logger.error(f"WebSocket error in ticket {ticket_id}: {e}")
             ticket_manager.disconnect(websocket, ticket_id)
 
-
 class _MsgBody(BaseModel):
     message: str
-
 
 @app.post("/v1/tickets/{ticket_id}/messages", status_code=201, tags=["Tickets"])
 async def user_send_message(
@@ -3463,10 +3329,8 @@ async def user_send_message(
                      {"ticket_id": ticket_id}, tenant_id=current["tenant_id"])
     return {"message_id": mid, "status": "sent"}
 
-
 class _CloseBody(BaseModel):
     note: str
-
 
 @app.post("/v1/tickets/{ticket_id}/close", tags=["Tickets"])
 async def user_close_ticket(
@@ -3501,7 +3365,6 @@ async def user_close_ticket(
                      tenant_id=current["tenant_id"])
     return {"status": "closed"}
 
-
 @app.post("/v1/tickets/{ticket_id}/mark-read", tags=["Tickets"])
 async def user_mark_read(ticket_id: str, current: dict = Depends(get_current_user)):
     """Mark all admin messages in this ticket as read from the user's side."""
@@ -3520,7 +3383,6 @@ async def user_mark_read(ticket_id: str, current: dict = Depends(get_current_use
             ticket_id,
         )
     return {"status": "marked_read"}
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ADMIN  (JWT — admin | superadmin)
@@ -3574,7 +3436,6 @@ async def admin_list_clients(
         )
     return {"clients": [dict(r) for r in rows], "total": total, "page": page}
 
-
 @app.get("/admin/clients/{client_id}", tags=["Admin"])
 async def admin_get_client(client_id: str, current: dict = Depends(require_admin)):
     pool = await get_pool()
@@ -3597,13 +3458,11 @@ async def admin_get_client(client_id: str, current: dict = Depends(require_admin
         "usage_30d":    dict(usage) if usage else {},
     }
 
-
 class _ClientUpdate(BaseModel):
     name:    Optional[str] = None
     company: Optional[str] = None
     phone:   Optional[str] = None
     domain:  Optional[str] = None
-
 
 @app.put("/admin/clients/{client_id}", tags=["Admin"])
 async def admin_update_client(
@@ -3624,10 +3483,6 @@ async def admin_update_client(
         )
         await _audit(conn, current, "update_client", "tenant", client_id, updates, tenant_id=client_id)
     return {"status": "updated"}
-
-
-
-
 
 @app.get("/admin/clients/{client_id}/usage", tags=["Admin"])
 async def admin_client_usage(
@@ -3659,7 +3514,6 @@ async def admin_client_usage(
         "days":    days,
     }
 
-
 @app.get("/admin/clients/{client_id}/tickets", tags=["Admin"])
 async def admin_client_tickets(
     client_id: str,
@@ -3681,12 +3535,8 @@ async def admin_client_tickets(
         )
     return {"tickets": [dict(r) for r in rows]}
 
-
 class _ExtendPlan(BaseModel):
     days: int
-
-
-
 
 @app.post("/admin/clients/{client_id}/extend-plan", tags=["Admin"])
 async def admin_extend_plan(
@@ -3704,10 +3554,8 @@ async def admin_extend_plan(
         await _audit(conn, current, "extend_plan", "subscription", client_id, {"days": body.days}, tenant_id=client_id)
     return {"status": "extended", "days_added": body.days}
 
-
 class _ChangePlan(BaseModel):
     plan: str
-
 
 @app.post("/admin/clients/{client_id}/change-plan", tags=["Admin"])
 async def admin_change_plan(
@@ -3733,7 +3581,6 @@ async def admin_change_plan(
                      {"from": old_plan, "to": body.plan}, tenant_id=client_id)
     return {"status": "changed", "plan": body.plan}
 
-
 @app.post("/admin/clients/{client_id}/suspend", tags=["Admin"])
 async def admin_suspend(client_id: str, current: dict = Depends(require_admin)):
     pool = await get_pool()
@@ -3744,7 +3591,6 @@ async def admin_suspend(client_id: str, current: dict = Depends(require_admin)):
         await _audit(conn, current, "suspend_tenant", "tenant", client_id, {}, tenant_id=client_id)
     return {"status": "suspended"}
 
-
 @app.post("/admin/clients/{client_id}/activate", tags=["Admin"])
 async def admin_activate(client_id: str, current: dict = Depends(require_admin)):
     pool = await get_pool()
@@ -3754,7 +3600,6 @@ async def admin_activate(client_id: str, current: dict = Depends(require_admin))
         )
         await _audit(conn, current, "activate_tenant", "tenant", client_id, {}, tenant_id=client_id)
     return {"status": "active"}
-
 
 # ── Admin tickets ──────────────────────────────────────────────────────────────
 @app.get("/admin/tickets", tags=["Admin"])
@@ -3794,7 +3639,6 @@ async def admin_list_tickets(
         )
     return {"tickets": [dict(r) for r in rows]}
 
-
 @app.get("/admin/tickets/{ticket_id}", tags=["Admin"])
 async def admin_get_ticket(ticket_id: str, current: dict = Depends(require_admin)):
     pool = await get_pool()
@@ -3831,7 +3675,6 @@ async def admin_get_ticket(ticket_id: str, current: dict = Depends(require_admin
     t["status_log"]  = [dict(l) for l in log]
     return t
 
-
 @app.get("/admin/tickets/{ticket_id}/messages", tags=["Admin"])
 async def admin_get_messages(ticket_id: str, current: dict = Depends(require_admin)):
     pool = await get_pool()
@@ -3847,7 +3690,6 @@ async def admin_get_messages(ticket_id: str, current: dict = Depends(require_adm
             ticket_id,
         )
     return {"messages": [dict(m) for m in msgs]}
-
 
 @app.post("/admin/tickets/{ticket_id}/messages", status_code=201, tags=["Admin"])
 async def admin_send_message(
@@ -3880,7 +3722,6 @@ async def admin_send_message(
             await _audit(conn, current, "send_message", "ticket_message", mid,
                          {"ticket_id": ticket_id})
     return {"message_id": mid, "status": "sent"}
-
 
 @app.post("/admin/tickets/{ticket_id}/claim", tags=["Admin"])
 async def admin_claim_ticket(ticket_id: str, current: dict = Depends(require_admin)):
@@ -3923,10 +3764,8 @@ async def admin_claim_ticket(ticket_id: str, current: dict = Depends(require_adm
             await _audit(conn, current, "claim_ticket", "ticket", ticket_id, {})
     return {"status": "claimed"}
 
-
 class _ResolveBody(BaseModel):
     note: str
-
 
 @app.post("/admin/tickets/{ticket_id}/resolve", tags=["Admin"])
 async def admin_resolve_ticket(
@@ -3960,7 +3799,6 @@ async def admin_resolve_ticket(
                          {"note": body.note[:100]})
     return {"status": "solved"}
 
-
 @app.post("/admin/tickets/{ticket_id}/mark-read", tags=["Admin"])
 async def admin_mark_read(ticket_id: str, current: dict = Depends(require_admin)):
     """Mark all user messages in this ticket as read from the admin's side."""
@@ -3975,7 +3813,6 @@ async def admin_mark_read(ticket_id: str, current: dict = Depends(require_admin)
             ticket_id,
         )
     return {"status": "marked_read"}
-
 
 @app.post("/admin/tickets/{ticket_id}/assign", tags=["Admin"])
 async def admin_assign_ticket(
@@ -4016,7 +3853,6 @@ async def admin_assign_ticket(
         await _audit(conn, current, "assign_ticket", "ticket", ticket_id,
                      {"admin_id": admin_id})
     return {"status": "assigned", "admin_id": admin_id}
-
 
 @app.get("/admin/analytics", tags=["Admin"])
 async def admin_analytics(days: int = 30, current: dict = Depends(require_admin)):
@@ -4111,12 +3947,9 @@ async def admin_analytics(days: int = 30, current: dict = Depends(require_admin)
         "plan_distribution": plan_distribution
     }
 
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # SUPERADMIN  (JWT — superadmin)
 # ═════════════════════════════════════════════════════════════════════════════
-
 
 @app.get("/superadmin/clients", tags=["SuperAdmin"])
 
@@ -4167,7 +4000,6 @@ async def sa_list_clients(
         )
     return {"clients": [dict(r) for r in rows], "total": total, "page": page}
 
-
 @app.get("/superadmin/clients/{client_id}", tags=["SuperAdmin"])
 async def sa_get_client(client_id: str, current: dict = Depends(require_superadmin)):
     """Full client detail including audit log — superadmin only."""
@@ -4216,7 +4048,6 @@ async def sa_get_client(client_id: str, current: dict = Depends(require_superadm
         "audit_log":    [dict(a) for a in audit],
     }
 
-
 @app.post("/superadmin/clients/{client_id}/toggle-domain-verified", tags=["SuperAdmin"])
 async def sa_toggle_domain_verified(
     client_id: str, body: dict = Body(...),
@@ -4234,7 +4065,6 @@ async def sa_toggle_domain_verified(
                      {"domain_verified": verified})
     return {"status": "ok", "domain_verified": verified}
 
-
 @app.post("/superadmin/clients/{client_id}/ticket-limit", tags=["SuperAdmin"])
 async def sa_set_client_ticket_limit(
     client_id: str, body: dict, current: dict = Depends(require_superadmin)
@@ -4249,7 +4079,6 @@ async def sa_set_client_ticket_limit(
         await _audit(conn, current, "set_ticket_limit", "tenant", client_id, {"limit": limit}, tenant_id=client_id)
     return {"status": "updated", "limit": limit}
 
-
 @app.post("/superadmin/clients/{client_id}/force-logout", tags=["SuperAdmin"])
 async def sa_force_logout(client_id: str, current: dict = Depends(require_superadmin)):
     pool = await get_pool()
@@ -4257,7 +4086,6 @@ async def sa_force_logout(client_id: str, current: dict = Depends(require_supera
         await _audit(conn, current, "force_logout", "tenant", client_id, {}, tenant_id=client_id)
     # Stateless JWT: client must discard token. Add token-blacklist table for hard enforcement.
     return {"status": "force_logout_recorded"}
-
 
 @app.delete("/superadmin/clients/{client_id}", tags=["SuperAdmin"])
 async def sa_delete_client(client_id: str, current: dict = Depends(require_superadmin)):
@@ -4267,7 +4095,6 @@ async def sa_delete_client(client_id: str, current: dict = Depends(require_super
         await _audit(conn, current, "delete_tenant", "tenant", client_id, {}, tenant_id=client_id)
     await app.state.s3.delete_prefix(f"tenants/{client_id}/")
     return {"status": "deleted"}
-
 
 # ── Superadmin: Change Tenant Email (OTP-verified) ────────────────────────
 
@@ -4335,7 +4162,6 @@ async def sa_request_email_change(
 
     return {"status": "otp_sent", "message": f"OTP sent to {body.new_email}"}
 
-
 @app.post("/superadmin/clients/{client_id}/confirm-email-change", tags=["SuperAdmin"])
 async def sa_confirm_email_change(
     client_id: str, body: _EmailChangeConfirm, current: dict = Depends(require_superadmin)
@@ -4344,8 +4170,7 @@ async def sa_confirm_email_change(
     import hashlib, json as _json
     otp_hash = hashlib.sha256(body.otp.encode()).hexdigest()
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         # Verify OTP
         otp_row = await conn.fetchrow(
             "SELECT id, payload FROM otps"
@@ -4390,13 +4215,11 @@ async def sa_confirm_email_change(
 
     return {"status": "email_changed", "new_email": body.new_email}
 
-
 # ── Superadmin Knowledge Base Manager ───────────────────────────────────────
 
 @app.get("/superadmin/clients/{client_id}/knowledge/list", tags=["SuperAdmin"])
 async def sa_list_knowledge(client_id: str, current: dict = Depends(require_superadmin)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         docs = await conn.fetch("SELECT * FROM ingest_jobs WHERE tenant_id=$1 ORDER BY created_at DESC", client_id)
         qa = await conn.fetch("SELECT * FROM knowledge_qa WHERE tenant_id=$1 ORDER BY created_at DESC", client_id)
     return {
@@ -4421,9 +4244,8 @@ async def sa_ingest_document(client_id: str, file: UploadFile = File(...), curre
 
 @app.post("/superadmin/clients/{client_id}/knowledge/qa", tags=["SuperAdmin"])
 async def sa_add_qa(client_id: str, req: KnowledgeQACreate, current: dict = Depends(require_superadmin)):
-    pool = await get_pool()
     qa_id = secrets.token_hex(8)
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         async with conn.transaction():
             await conn.execute(
                 "INSERT INTO knowledge_qa (id, tenant_id, question, answer) VALUES ($1, $2, $3, $4)",
@@ -4443,8 +4265,7 @@ async def sa_add_qa(client_id: str, req: KnowledgeQACreate, current: dict = Depe
 
 @app.delete("/superadmin/clients/{client_id}/knowledge/qa/{qa_id}", tags=["SuperAdmin"])
 async def sa_delete_qa(client_id: str, qa_id: str, current: dict = Depends(require_superadmin)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         row = await conn.fetchrow("SELECT id FROM knowledge_qa WHERE id=$1 AND tenant_id=$2", qa_id, client_id)
         if not row:
             raise HTTPException(status_code=404, detail="Q/A not found")
@@ -4462,8 +4283,7 @@ async def sa_delete_qa(client_id: str, qa_id: str, current: dict = Depends(requi
 
 @app.delete("/superadmin/clients/{client_id}/knowledge/{doc_id}", tags=["SuperAdmin"])
 async def sa_delete_document(client_id: str, doc_id: str, current: dict = Depends(require_superadmin)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         row = await conn.fetchrow("SELECT id FROM ingest_jobs WHERE id=$1 AND tenant_id=$2", doc_id, client_id)
         if not row:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -4477,14 +4297,12 @@ async def sa_delete_document(client_id: str, doc_id: str, current: dict = Depend
 
     return {"status": "deleted", "doc_id": doc_id}
 
-
 # ── Superadmin Structured KB (mirrors tenant KB screen) ─────────────────────
 
 @app.get("/superadmin/clients/{client_id}/kb/company", tags=["SuperAdmin"])
 async def sa_kb_get_company(client_id: str, current: dict = Depends(require_superadmin)):
     """Fetch all company data fields for a client — superadmin."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         rows = await conn.fetch(
             "SELECT id, section, field_key, field_value, display_order "
             "FROM kb_company_data WHERE tenant_id=$1 ORDER BY section, display_order",
@@ -4492,12 +4310,10 @@ async def sa_kb_get_company(client_id: str, current: dict = Depends(require_supe
         )
     return {"data": [dict(r) for r in rows], "sections": _KB_SECTIONS}
 
-
 @app.put("/superadmin/clients/{client_id}/kb/company", tags=["SuperAdmin"])
 async def sa_kb_update_company(client_id: str, req: CompanyDataUpdate, current: dict = Depends(require_superadmin)):
     """Batch upsert company data for a client — superadmin."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         async with conn.transaction():
             for idx, item in enumerate(req.data):
                 if item.section not in _KB_SECTIONS:
@@ -4513,24 +4329,20 @@ async def sa_kb_update_company(client_id: str, req: CompanyDataUpdate, current: 
             await _audit(conn, current, "update", "kb_company_data", client_id, {"count": len(req.data)}, tenant_id=client_id)
     return {"status": "saved", "count": len(req.data)}
 
-
 @app.get("/superadmin/clients/{client_id}/kb/products", tags=["SuperAdmin"])
 async def sa_kb_list_products(client_id: str, current: dict = Depends(require_superadmin)):
     """List all products for a client — superadmin."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         rows = await conn.fetch(
             "SELECT * FROM kb_products WHERE tenant_id=$1 ORDER BY category, name", client_id,
         )
     return {"products": [dict(r) for r in rows]}
 
-
 @app.post("/superadmin/clients/{client_id}/kb/products", status_code=201, tags=["SuperAdmin"])
 async def sa_kb_create_product(client_id: str, req: ProductCreate, current: dict = Depends(require_superadmin)):
     """Create a product for a client — superadmin."""
     pid = secrets.token_hex(8)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         await conn.execute(
             "INSERT INTO kb_products (id, tenant_id, category, sub_category, name, description, "
             "image_url, pricing, min_order_qty, source_url) "
@@ -4541,12 +4353,10 @@ async def sa_kb_create_product(client_id: str, req: ProductCreate, current: dict
         await _audit(conn, current, "create", "kb_product", pid, {"name": req.name, "target_tenant": client_id}, tenant_id=client_id)
     return {"id": pid, "status": "created"}
 
-
 @app.put("/superadmin/clients/{client_id}/kb/products/{product_id}", tags=["SuperAdmin"])
 async def sa_kb_update_product(client_id: str, product_id: str, req: ProductUpdate, current: dict = Depends(require_superadmin)):
     """Update a product for a client — superadmin."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         existing = await conn.fetchrow(
             "SELECT id FROM kb_products WHERE id=$1 AND tenant_id=$2", product_id, client_id,
         )
@@ -4567,12 +4377,10 @@ async def sa_kb_update_product(client_id: str, product_id: str, req: ProductUpda
         await _audit(conn, current, "update", "kb_product", product_id, {"target_tenant": client_id}, tenant_id=client_id)
     return {"status": "updated"}
 
-
 @app.delete("/superadmin/clients/{client_id}/kb/products/{product_id}", tags=["SuperAdmin"])
 async def sa_kb_delete_product(client_id: str, product_id: str, current: dict = Depends(require_superadmin)):
     """Delete a product for a client — superadmin."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         row = await conn.fetchrow(
             "SELECT id FROM kb_products WHERE id=$1 AND tenant_id=$2", product_id, client_id,
         )
@@ -4581,7 +4389,6 @@ async def sa_kb_delete_product(client_id: str, product_id: str, current: dict = 
         await conn.execute("DELETE FROM kb_products WHERE id=$1", product_id)
         await _audit(conn, current, "delete", "kb_product", product_id, {"target_tenant": client_id}, tenant_id=client_id)
     return {"status": "deleted"}
-
 
 @app.post("/superadmin/clients/{client_id}/kb/products/upload-image", tags=["SuperAdmin"])
 async def sa_kb_upload_product_image(
@@ -4609,7 +4416,6 @@ async def sa_kb_upload_product_image(
 
     return {"image_url": app.state.s3.resolve_url(actual_key)}
 
-
 @app.post("/superadmin/clients/{client_id}/kb/products/scrape-url", tags=["SuperAdmin"])
 async def sa_kb_scrape_product_url(
     client_id: str, url: str = Body(..., embed=True), current: dict = Depends(require_superadmin),
@@ -4628,14 +4434,12 @@ async def sa_kb_scrape_product_url(
         raise HTTPException(502, f"Enrichment failed: {e}")
     return {"status": "enriched", "page_title": page_data.get("title", ""), "product": enriched}
 
-
 @app.post("/superadmin/clients/{client_id}/kb/sync", tags=["SuperAdmin"])
 async def sa_kb_sync_vectors(client_id: str, current: dict = Depends(require_superadmin)):
     """Trigger vector DB rebuild for a client — superadmin."""
-    pool = await get_pool()
     import hashlib
     chunks = []
-    async with pool.acquire() as conn:
+    async with tenant_conn(client_id) as conn:
         company_rows = await conn.fetch(
             "SELECT section, field_key, field_value FROM kb_company_data "
             "WHERE tenant_id=$1 ORDER BY section, display_order", client_id,
@@ -4677,8 +4481,6 @@ async def sa_kb_sync_vectors(client_id: str, current: dict = Depends(require_sup
     except Exception as e:
         raise HTTPException(502, f"Vector sync failed: {e}")
 
-
-
 # ── Admin management ───────────────────────────────────────────────────────────
 @app.get("/superadmin/admins", tags=["SuperAdmin"])
 async def sa_list_admins(current: dict = Depends(require_superadmin)):
@@ -4695,19 +4497,16 @@ async def sa_list_admins(current: dict = Depends(require_superadmin)):
         )
     return {"admins": [dict(r) for r in rows]}
 
-
 class _NewAdmin(BaseModel):
     name:     str
     email:    EmailStr
     password: str
-
 
 class _EditAdmin(BaseModel):
     name:         Optional[str] = None
     ticket_limit: Optional[int] = None
     status:       Optional[str] = None
     role:         Optional[str] = None
-
 
 @app.post("/superadmin/admins", status_code=201, tags=["SuperAdmin"])
 async def sa_create_admin(body: _NewAdmin, current: dict = Depends(require_superadmin)):
@@ -4726,7 +4525,6 @@ async def sa_create_admin(body: _NewAdmin, current: dict = Depends(require_super
         await _audit(conn, current, "create_admin", "admin_user", aid,
                      {"email": body.email, "name": body.name})
     return {"admin_id": aid, "status": "created"}
-
 
 @app.put("/superadmin/admins/{admin_id}", tags=["SuperAdmin"])
 async def sa_edit_admin(
@@ -4754,7 +4552,6 @@ async def sa_edit_admin(
             raise HTTPException(status_code=404, detail="Admin not found")
         await _audit(conn, current, "edit_admin", "admin_user", admin_id, updates)
     return {"status": "updated", "fields": keys}
-
 
 # In-memory store for delete OTPs
 ADMIN_DELETE_OTPS = {}
@@ -4784,7 +4581,6 @@ async def sa_request_delete_admin(admin_id: str, current: dict = Depends(require
         
     return {"status": "otp_sent", "message": f"OTP sent to all superadmins"}
 
-
 @app.delete("/superadmin/admins/{admin_id}", tags=["SuperAdmin"])
 async def sa_remove_admin(admin_id: str, otp: str, current: dict = Depends(require_superadmin)):
     if ADMIN_DELETE_OTPS.get(admin_id) != otp:
@@ -4804,7 +4600,6 @@ async def sa_remove_admin(admin_id: str, otp: str, current: dict = Depends(requi
     ADMIN_DELETE_OTPS.pop(admin_id, None)
     return {"status": "deleted"}
 
-
 @app.post("/superadmin/admins/{admin_id}/ticket-limit", tags=["SuperAdmin"])
 async def sa_set_admin_ticket_limit(
     admin_id: str, body: dict, current: dict = Depends(require_superadmin)
@@ -4818,7 +4613,6 @@ async def sa_set_admin_ticket_limit(
         )
         await _audit(conn, current, "set_ticket_limit", "admin_user", admin_id, {"limit": limit})
     return {"status": "updated", "limit": limit}
-
 
 # ── Superadmin ticket monitor ──────────────────────────────────────────────────
 @app.get("/superadmin/tickets", tags=["SuperAdmin"])
@@ -4863,10 +4657,8 @@ async def sa_list_tickets(
         )
     return {"tickets": [dict(r) for r in rows], "total": total, "page": page}
 
-
 class _PriorityBody(BaseModel):
     priority: str
-
 
 @app.post("/superadmin/tickets/{ticket_id}/change-priority", tags=["SuperAdmin"])
 async def sa_change_ticket_priority(
@@ -4886,7 +4678,6 @@ async def sa_change_ticket_priority(
                      {"priority": body.priority})
     return {"status": "updated", "priority": body.priority}
 
-
 # ── Platform settings ──────────────────────────────────────────────────────────
 @app.get("/superadmin/settings", tags=["SuperAdmin"])
 async def sa_get_settings(current: dict = Depends(require_superadmin)):
@@ -4894,7 +4685,6 @@ async def sa_get_settings(current: dict = Depends(require_superadmin)):
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT key, value FROM platform_settings ORDER BY key")
     return {r["key"]: r["value"] for r in rows}
-
 
 @app.put("/superadmin/settings", tags=["SuperAdmin"])
 async def sa_update_settings(body: dict, current: dict = Depends(require_superadmin)):
@@ -4920,7 +4710,6 @@ async def sa_update_settings(body: dict, current: dict = Depends(require_superad
                 )
             await _audit(conn, current, "update_settings", "platform", "settings", body)
     return {"status": "updated", "fields": list(body.keys())}
-
 
 # ── Audit log ──────────────────────────────────────────────────────────────────
 @app.get("/superadmin/audit-log", tags=["SuperAdmin"])
@@ -4967,7 +4756,6 @@ async def sa_audit_log(
         )
     return {"log": [dict(r) for r in rows], "total": total, "page": page}
 
-
 # ── Plan Management (Superadmin) ────────────────────────────────────────────────
 @app.get("/superadmin/plans", tags=["SuperAdmin"])
 async def sa_list_plans(current: dict = Depends(require_superadmin)):
@@ -4975,7 +4763,6 @@ async def sa_list_plans(current: dict = Depends(require_superadmin)):
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM plans ORDER BY onboarding_fee_rupee")
     return {"plans": [dict(r) for r in rows]}
-
 
 @app.post("/superadmin/plans", status_code=201, tags=["SuperAdmin"])
 async def sa_create_plan(body: PlanCreate, current: dict = Depends(require_superadmin)):
@@ -4994,7 +4781,6 @@ async def sa_create_plan(body: PlanCreate, current: dict = Depends(require_super
         )
         await _audit(conn, current, "create_plan", "plan", body.id, body.model_dump())
     return {"status": "created", "plan_id": body.id}
-
 
 @app.put("/superadmin/plans/{plan_id}", tags=["SuperAdmin"])
 async def sa_update_plan(plan_id: str, body: PlanUpdate, current: dict = Depends(require_superadmin)):
@@ -5016,7 +4802,6 @@ async def sa_update_plan(plan_id: str, body: PlanUpdate, current: dict = Depends
             raise HTTPException(status_code=404, detail="Plan not found")
         await _audit(conn, current, "update_plan", "plan", plan_id, updates)
     return {"status": "updated", "plan_id": plan_id}
-
 
 @app.delete("/superadmin/plans/{plan_id}", tags=["SuperAdmin"])
 async def sa_delete_plan(plan_id: str, current: dict = Depends(require_superadmin)):

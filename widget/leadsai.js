@@ -6,15 +6,26 @@
   }
 
   // 1. Determine API base from script src
-  let apiBase = "http://localhost:8000"; // default production
+  let apiBase = "https://outhouse-cognitive-magical.ngrok-free.dev"; // default production
   try {
     if (scriptTag.src) {
       const url = new URL(scriptTag.src);
       apiBase = url.origin;
     }
-  } catch (_) {}
+  } catch (_) { }
 
   const API_URL = apiBase;
+
+  // Base fetch helper — injects ngrok browser-warning bypass header on every request
+  const apiFetch = (path, options = {}) => {
+    return fetch(`${API_URL}${path}`, {
+      ...options,
+      headers: {
+        'ngrok-skip-browser-warning': 'true',
+        ...options.headers,
+      },
+    });
+  };
 
   // 2. Fetch Widget Token (JWT)
   let widgetJwt = null;
@@ -23,7 +34,7 @@
 
   if (companySlug) {
     try {
-      const tokenRes = await fetch(`${API_URL}/v1/widget/token`, {
+      const tokenRes = await apiFetch('/v1/widget/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company_slug: companySlug })
@@ -38,7 +49,7 @@
   } else {
     // Dashboard preview — use the logged-in user's JWT
     var dashToken = null;
-    try { dashToken = localStorage.getItem('oc_token'); } catch (_) {}
+    try { dashToken = localStorage.getItem('oc_token'); } catch (_) { }
     if (dashToken) {
       widgetJwt = dashToken;
       _isDashboardPreview = true;
@@ -55,7 +66,7 @@
   async function _refreshToken() {
     if (!companySlug) return false;
     try {
-      const tokenRes = await fetch(`${API_URL}/v1/widget/token`, {
+      const tokenRes = await apiFetch('/v1/widget/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company_slug: companySlug })
@@ -74,16 +85,22 @@
   }
 
   // Fetch with auto-retry on 401 (one retry after token refresh)
-  async function _authedFetch(url, options) {
-    let resp = await fetch(url, options);
+  async function _authedFetch(urlOrPath, options = {}) {
+    // Support both full URLs and paths
+    const fullUrl = urlOrPath.startsWith('http') ? urlOrPath : `${API_URL}${urlOrPath}`;
+    options = {
+      ...options,
+      headers: {
+        'ngrok-skip-browser-warning': 'true',
+        ...options.headers,
+      },
+    };
+    let resp = await fetch(fullUrl, options);
     if (resp.status === 401 && !_isDashboardPreview) {
       const refreshed = await _refreshToken();
       if (refreshed) {
-        // Update the auth header in the options
-        if (options.headers) {
-          options.headers['Authorization'] = 'Bearer ' + widgetJwt;
-        }
-        resp = await fetch(url, options);
+        options.headers['Authorization'] = 'Bearer ' + widgetJwt;
+        resp = await fetch(fullUrl, options);
       }
     }
     return resp;
@@ -92,10 +109,12 @@
   // 3. Fetch Dynamic Configuration
   let config = {};
   try {
-    var configUrl = companySlug
-      ? `${API_URL}/v1/widget/config?slug=${encodeURIComponent(companySlug)}`
-      : `${API_URL}/v1/widget/config`;
-    const res = await fetch(configUrl, { headers: authHeaders });
+    const res = await apiFetch(
+      companySlug
+        ? `/v1/widget/config?slug=${encodeURIComponent(companySlug)}`
+        : `/v1/widget/config`,
+      { headers: authHeaders }
+    );
     if (res.ok) {
       config = await res.json();
     }
@@ -104,35 +123,35 @@
   }
 
   var cfg = {
-    apiKey:    '',
-    apiBase:   API_URL,
-    position:  config.position || 'bottom-right',
-    color1:    config.primary_color || '#2952e3',
-    color2:    config.accent_color || '#00d4f5',
+    apiKey: '',
+    apiBase: API_URL,
+    position: config.position || 'bottom-right',
+    color1: config.primary_color || '#2952e3',
+    color2: config.accent_color || '#00d4f5',
     colorBotText: config.bot_text_color || '#ffffff',
     colorUserText: config.user_text_color || '#ffffff',
-    bgColor:   config.secondary_color || '#ffffff',
-    bgImage:   config.bg_image_url || '',
-    greeting:  config.greeting || "Hi there! 👋 I'm your AI assistant. How can I help you today?",
-    name:      config.business_name || "AI Assistant",
-    logoUrl:   config.logo_url ? (config.logo_url.startsWith('http') ? config.logo_url : API_URL + config.logo_url) : "",
+    bgColor: config.secondary_color || '#ffffff',
+    bgImage: config.bg_image_url || '',
+    greeting: config.greeting || "Hi there! 👋 I'm your AI assistant. How can I help you today?",
+    name: config.business_name || "AI Assistant",
+    logoUrl: config.logo_url ? (config.logo_url.startsWith('http') ? config.logo_url : API_URL + config.logo_url) : "",
     proactive: config.proactive_enabled !== false,
-    tts:       config.tts_enabled !== false,
-    stt:       config.stt_enabled !== false,
-    cv:        config.cv_search_enabled !== false,
-    langs:     config.languages || "en",
-    piiAfter:  config.pii_after_messages || 1,
+    tts: config.tts_enabled !== false,
+    stt: config.stt_enabled !== false,
+    cv: config.cv_search_enabled !== false,
+    langs: config.languages || "en",
+    piiAfter: config.pii_after_messages || 1,
     proactiveMsg: config.proactive_message || "Hi there! Need help? Chat with us!"
   };
 
   // ── Session / visitor IDs ───────────────────────────────────────
   var SESSION_ID = 'oc_' + Math.random().toString(36).substr(2, 12);
-  var VISITOR_ID = (function() {
+  var VISITOR_ID = (function () {
     try {
       var v = localStorage.getItem('oc_vid');
       if (!v) { v = 'v_' + Math.random().toString(36).substr(2, 16); localStorage.setItem('oc_vid', v); }
       return v;
-    } catch(e) { return 'v_' + Math.random().toString(36).substr(2, 16); }
+    } catch (e) { return 'v_' + Math.random().toString(36).substr(2, 16); }
   })();
 
   // ── State ───────────────────────────────────────────────────────
@@ -156,7 +175,7 @@
     '*{box-sizing:border-box;margin:0;padding:0}',
 
     /* Launcher */
-    '.launcher{width:60px;height:60px;border-radius:50%;background:linear-gradient(135deg,'+cfg.color1+','+cfg.color2+');border:none;cursor:pointer;box-shadow:0 4px 24px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;transition:transform .2s,box-shadow .2s;outline:none;position:relative;overflow:hidden;}',
+    '.launcher{width:60px;height:60px;border-radius:50%;background:linear-gradient(135deg,' + cfg.color1 + ',' + cfg.color2 + ');border:none;cursor:pointer;box-shadow:0 4px 24px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;transition:transform .2s,box-shadow .2s;outline:none;position:relative;overflow:hidden;}',
     '.launcher:hover{transform:scale(1.08);box-shadow:0 6px 32px rgba(0,0,0,.4)}',
     '.launcher svg{width:28px;height:28px;fill:white;transition:transform .3s;position:relative;z-index:2;}',
     '.launcher img.l-img{width:100%;height:100%;object-fit:cover;position:absolute;top:0;left:0;z-index:1;transition:opacity 0.3s;}',
@@ -175,7 +194,7 @@
     '@media(max-width:440px){.chat-win{width:calc(100vw - 24px);right:-4px}}',
 
     /* Header */
-    '.chat-header{background:linear-gradient(135deg,'+cfg.color1+','+cfg.color2+');padding:16px 16px 14px;color:white;flex-shrink:0}',
+    '.chat-header{background:linear-gradient(135deg,' + cfg.color1 + ',' + cfg.color2 + ');padding:16px 16px 14px;color:white;flex-shrink:0}',
     '.hdr-top{display:flex;align-items:center;justify-content:space-between}',
     '.agent-info{display:flex;align-items:center;gap:10px}',
     '.agent-av{width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;border:2px solid rgba(255,255,255,.3);overflow:hidden;}',
@@ -191,19 +210,19 @@
     '.lang-sel option{color:#1e293b;background:white}',
 
     /* Messages */
-    '.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth;background:'+cfg.bgColor+'} ' + (cfg.bgImage ? `.messages{background-image:url('${cfg.bgImage}');background-size:cover;background-position:center}` : ""),
+    '.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth;background:' + cfg.bgColor + '} ' + (cfg.bgImage ? `.messages{background-image:url('${cfg.bgImage}');background-size:cover;background-position:center}` : ""),
     '.messages::-webkit-scrollbar{width:4px}',
     '.messages::-webkit-scrollbar-thumb{background:#e2e8f0;border-radius:2px}',
 
     /* Message bubbles */
     '.msg{display:flex;gap:8px;max-width:100%}',
     '.msg.user{flex-direction:row-reverse}',
-    '.msg-av{width:28px;height:28px;border-radius:50%;background:'+cfg.color1+';color:white;font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px;font-weight:600;overflow:hidden;}',
+    '.msg-av{width:28px;height:28px;border-radius:50%;background:' + cfg.color1 + ';color:white;font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px;font-weight:600;overflow:hidden;}',
     '.msg-av img{width:100%;height:100%;object-fit:cover;}',
-    '.msg.user .msg-av{background:'+cfg.color2+'}',
+    '.msg.user .msg-av{background:' + cfg.color2 + '}',
     '.bubble{max-width:calc(100% - 44px);padding:10px 14px;border-radius:16px;font-size:12.5px;line-height:1.55;word-break:break-word}',
-    '.msg.assistant .bubble{background:'+cfg.color1+';color:'+cfg.colorBotText+';border-radius:4px 16px 16px 16px}',
-    '.msg.user .bubble{background:'+cfg.color2+';color:'+cfg.colorUserText+';border-radius:16px 4px 16px 16px}',
+    '.msg.assistant .bubble{background:' + cfg.color1 + ';color:' + cfg.colorBotText + ';border-radius:4px 16px 16px 16px}',
+    '.msg.user .bubble{background:' + cfg.color2 + ';color:' + cfg.colorUserText + ';border-radius:16px 4px 16px 16px}',
 
     /* Markdown inside bubbles */
     '.bubble h1,.bubble h2,.bubble h3{font-weight:700;margin:6px 0 2px}',
@@ -236,7 +255,7 @@
 
     /* Source chips — only shown for products with a link */
     '.src-chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}',
-    '.src-chip{background:rgba(255,255,255,.15);color:'+cfg.colorBotText+';padding:2px 8px;border-radius:20px;font-size:11px;border:1px solid rgba(255,255,255,.3);text-decoration:none;cursor:pointer;display:inline-flex;align-items:center;gap:3px}',
+    '.src-chip{background:rgba(255,255,255,.15);color:' + cfg.colorBotText + ';padding:2px 8px;border-radius:20px;font-size:11px;border:1px solid rgba(255,255,255,.3);text-decoration:none;cursor:pointer;display:inline-flex;align-items:center;gap:3px}',
     '.src-chip:hover{background:rgba(255,255,255,.28)}',
 
     /* Product cards */
@@ -247,7 +266,7 @@
     '.product-card:hover{background:rgba(255,255,255,0.2)}',
     '.product-card .p-icon{width:100%;height:60px;background:rgba(255,255,255,0.1);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:6px;overflow:hidden;}',
     '.product-card .p-icon img{width:100%;height:100%;object-fit:cover;}',
-    '.product-card .p-name{font-size:12px;font-weight:600;color:'+cfg.colorBotText+';line-height:1.3;margin-bottom:3px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}',
+    '.product-card .p-name{font-size:12px;font-weight:600;color:' + cfg.colorBotText + ';line-height:1.3;margin-bottom:3px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}',
     '.product-card .p-price{font-size:11px;color:rgba(255,255,255,0.8);font-weight:500}',
 
     /* PII card */
@@ -256,25 +275,25 @@
     '.pii-card p{font-size:12px;color:#64748b;margin-bottom:12px}',
     '.pii-form{display:flex;flex-direction:column;gap:8px}',
     '.pii-inp{border:1px solid #e2e8f0;border-radius:8px;padding:8px 12px;font-size:13px;outline:none;transition:border-color .15s;width:100%;font-family:inherit;color:#1e293b;background:white}',
-    '.pii-inp:focus{border-color:'+cfg.color1+'}',
-    '.pii-btn{background:linear-gradient(135deg,'+cfg.color1+','+cfg.color2+');color:white;border:none;border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;font-weight:600;font-family:inherit}',
+    '.pii-inp:focus{border-color:' + cfg.color1 + '}',
+    '.pii-btn{background:linear-gradient(135deg,' + cfg.color1 + ',' + cfg.color2 + ');color:white;border:none;border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;font-weight:600;font-family:inherit}',
     '.pii-btn:disabled{opacity:0.5;cursor:not-allowed}',
 
     /* Input area */
     '.input-area{padding:10px 12px 12px;background:white;border-top:1px solid #f1f5f9;flex-shrink:0}',
     '.input-row{display:flex;gap:6px;align-items:flex-end}',
     '.input-box{flex:1;min-height:40px;max-height:100px;border:1.5px solid #e2e8f0;border-radius:20px;padding:9px 14px;font-size:14px;outline:none;resize:none;overflow-y:auto;font-family:inherit;line-height:1.4;transition:border-color .15s;color:#1e293b;background:#f8fafc}',
-    '.input-box:focus{border-color:'+cfg.color1+';background:white}',
+    '.input-box:focus{border-color:' + cfg.color1 + ';background:white}',
     '.input-box::placeholder{color:#94a3b8}',
     '.act-btn{width:36px;height:36px;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:15px;transition:all .15s;outline:none;background:#f1f5f9;color:#64748b;flex-shrink:0}',
     '.act-btn:hover{background:#e2e8f0;color:#475569}',
-    '.send-btn{background:linear-gradient(135deg,'+cfg.color1+','+cfg.color2+');color:white}',
+    '.send-btn{background:linear-gradient(135deg,' + cfg.color1 + ',' + cfg.color2 + ');color:white}',
     '.send-btn:hover{opacity:.9;transform:scale(1.05)}',
     '.send-btn:disabled{opacity:.5;cursor:not-allowed;transform:none}',
     // '.mic-btn.recording{background:#ef4444;color:white;animation:micPulse 1.2s ease-in-out infinite}',
     // '@keyframes micPulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}',
     '.powered{text-align:center;font-size:11px;color:#94a3b8;padding-top:6px}',
-    '.powered a{color:'+cfg.color2+';text-decoration:none}',
+    '.powered a{color:' + cfg.color2 + ';text-decoration:none}',
 
     /* Plus menu */
     '.plus-menu{position:absolute;bottom:100%;left:0;margin-bottom:8px;background:white;border:1px solid #e2e8f0;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.15);overflow:hidden;min-width:180px;transform-origin:bottom left;transition:transform .15s,opacity .15s;transform:scale(.9);opacity:0;pointer-events:none;z-index:10}',
@@ -349,18 +368,18 @@
 
   // ── Element shortcuts ───────────────────────────────────────────
   function g(id) { return shadow.getElementById(id); }
-  var launcher  = g('launcher');
-  var chatWin   = g('chatWin');
-  var msgs      = g('msgs');
-  var inputBox  = g('inputBox');
-  var sendBtn   = g('sendBtn');
-  var closeBtn  = g('closeBtn');
-  var plusBtn   = g('plusBtn');
-  var plusMenu  = g('plusMenu');
-  var micBtn    = g('micBtn');
-  var proEl     = g('pro');
-  var langSel   = g('langSel');
-  var cvInputCamera  = g('cvInputCamera');
+  var launcher = g('launcher');
+  var chatWin = g('chatWin');
+  var msgs = g('msgs');
+  var inputBox = g('inputBox');
+  var sendBtn = g('sendBtn');
+  var closeBtn = g('closeBtn');
+  var plusBtn = g('plusBtn');
+  var plusMenu = g('plusMenu');
+  var micBtn = g('micBtn');
+  var proEl = g('pro');
+  var langSel = g('langSel');
+  var cvInputCamera = g('cvInputCamera');
   var cvInputGallery = g('cvInputGallery');
 
   // ── Open / Close ────────────────────────────────────────────────
@@ -368,24 +387,24 @@
     isOpen = true;
     chatWin.classList.add('open');
     launcher.classList.add('open');
-    g('launchPath').setAttribute('d','M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z');
+    g('launchPath').setAttribute('d', 'M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z');
     proEl.style.display = 'none';
     // Bug 1 fix: only show greeting once across all open/close cycles
     if (!greetingShown) { addMsg('assistant', cfg.greeting); greetingShown = true; }
-    setTimeout(function() { inputBox.focus(); }, 300);
+    setTimeout(function () { inputBox.focus(); }, 300);
   }
 
   function closeChat() {
     isOpen = false;
     chatWin.classList.remove('open');
     launcher.classList.remove('open');
-    g('launchPath').setAttribute('d','M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z');
+    g('launchPath').setAttribute('d', 'M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z');
   }
 
-  launcher.addEventListener('click', function() { isOpen ? closeChat() : openChat(); });
+  launcher.addEventListener('click', function () { isOpen ? closeChat() : openChat(); });
   closeBtn.addEventListener('click', closeChat);
-  g('proClose').addEventListener('click', function() { proEl.style.display = 'none'; });
-  proEl.addEventListener('click', function(e) {
+  g('proClose').addEventListener('click', function () { proEl.style.display = 'none'; });
+  proEl.addEventListener('click', function (e) {
     if (e.target.id !== 'proClose') { openChat(); proEl.style.display = 'none'; }
   });
 
@@ -395,39 +414,39 @@
 
   // ── Plus Menu (attach image) ────────────────────────────────────
   var plusOpen = false;
-  plusBtn.addEventListener('click', function(e) {
+  plusBtn.addEventListener('click', function (e) {
     e.stopPropagation();
     plusOpen = !plusOpen;
     plusMenu.classList.toggle('open', plusOpen);
   });
   // Close menu on outside click
-  shadow.addEventListener('click', function(e) {
+  shadow.addEventListener('click', function (e) {
     if (plusOpen && !plusMenu.contains(e.target) && e.target !== plusBtn) {
       plusOpen = false;
       plusMenu.classList.remove('open');
     }
   });
 
-  g('pmCamera').addEventListener('click', function() {
+  g('pmCamera').addEventListener('click', function () {
     plusOpen = false; plusMenu.classList.remove('open');
     cvInputCamera.click();
   });
-  g('pmGallery').addEventListener('click', function() {
+  g('pmGallery').addEventListener('click', function () {
     plusOpen = false; plusMenu.classList.remove('open');
     cvInputGallery.click();
   });
 
-  cvInputCamera.addEventListener('change', function(e) { if (e.target.files && e.target.files[0]) handleImage(e.target.files[0]); cvInputCamera.value = ''; });
-  cvInputGallery.addEventListener('change', function(e) { if (e.target.files && e.target.files[0]) handleImage(e.target.files[0]); cvInputGallery.value = ''; });
+  cvInputCamera.addEventListener('change', function (e) { if (e.target.files && e.target.files[0]) handleImage(e.target.files[0]); cvInputCamera.value = ''; });
+  cvInputGallery.addEventListener('change', function (e) { if (e.target.files && e.target.files[0]) handleImage(e.target.files[0]); cvInputGallery.value = ''; });
 
   // ── Lightweight Markdown → HTML parser ──────────────────────────
   function _md(src) {
     if (!src) return '';
     // Escape HTML to prevent XSS
-    var s = src.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    var s = src.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
     // Code blocks (```...```)
-    s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, function(_, lang, code) {
+    s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, function (_, lang, code) {
       return '<pre><code>' + code.trim() + '</code></pre>';
     });
 
@@ -441,8 +460,8 @@
 
       // Headers
       if (/^### (.+)/.test(line)) { closeLst(); html.push('<h3>' + inline(line.slice(4)) + '</h3>'); continue; }
-      if (/^## (.+)/.test(line))  { closeLst(); html.push('<h2>' + inline(line.slice(3)) + '</h2>'); continue; }
-      if (/^# (.+)/.test(line))   { closeLst(); html.push('<h1>' + inline(line.slice(2)) + '</h1>'); continue; }
+      if (/^## (.+)/.test(line)) { closeLst(); html.push('<h2>' + inline(line.slice(3)) + '</h2>'); continue; }
+      if (/^# (.+)/.test(line)) { closeLst(); html.push('<h1>' + inline(line.slice(2)) + '</h1>'); continue; }
 
       // Horizontal rule
       if (/^[-*_]{3,}\s*$/.test(line)) { closeLst(); html.push('<hr>'); continue; }
@@ -509,8 +528,8 @@
       var aBtn = document.createElement('button');
       aBtn.className = 'audio-btn';
       aBtn.textContent = '🔊 Play';
-      (function(url, btn) {
-        btn.addEventListener('click', function() { playAudio(url, btn); });
+      (function (url, btn) {
+        btn.addEventListener('click', function () { playAudio(url, btn); });
       })(audioUrl, aBtn);
       bbl.appendChild(aBtn);
     }
@@ -540,7 +559,7 @@
     var el = document.createElement('div');
     el.className = 'msg assistant';
     el.id = 'typing-ind';
-    el.innerHTML = '<div class="msg-av">' + (cfg.logoUrl ? `<img src="${cfg.logoUrl}" onerror="this.style.display='none'"/>` : '🤖') + '</div><div class="bubble typing-bbl" style="background:'+cfg.color1+';"><div class="typing-dots"><span></span><span></span><span></span></div></div>';
+    el.innerHTML = '<div class="msg-av">' + (cfg.logoUrl ? `<img src="${cfg.logoUrl}" onerror="this.style.display='none'"/>` : '🤖') + '</div><div class="bubble typing-bbl" style="background:' + cfg.color1 + ';"><div class="typing-dots"><span></span><span></span><span></span></div></div>';
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
   }
@@ -551,13 +570,13 @@
   }
 
   function playAudio(url, btn) {
-    if (currentAudio) { try { currentAudio.pause(); } catch(e){} currentAudio = null; }
+    if (currentAudio) { try { currentAudio.pause(); } catch (e) { } currentAudio = null; }
     if (url && url.indexOf('data:') === 0) {
       var a = new Audio(url);
       currentAudio = a;
       btn.textContent = '⏸ Playing';
-      a.play().catch(function(){});
-      a.onended = function() { btn.textContent = '🔊 Play'; currentAudio = null; };
+      a.play().catch(function () { });
+      a.onended = function () { btn.textContent = '🔊 Play'; currentAudio = null; };
     }
   }
 
@@ -582,53 +601,53 @@
     var phoneRow = document.createElement('div');
     phoneRow.style.display = 'flex';
     phoneRow.style.gap = '8px';
-    
+
     var codeList = document.createElement('datalist');
     codeList.id = 'country-codes';
     var codes = [
-      '+93 (Afghanistan)','+355 (Albania)','+213 (Algeria)','+376 (Andorra)','+244 (Angola)',
-      '+54 (Argentina)','+374 (Armenia)','+61 (Australia)','+43 (Austria)','+994 (Azerbaijan)',
-      '+973 (Bahrain)','+880 (Bangladesh)','+375 (Belarus)','+32 (Belgium)','+501 (Belize)',
-      '+229 (Benin)','+975 (Bhutan)','+591 (Bolivia)','+387 (Bosnia)','+267 (Botswana)',
-      '+55 (Brazil)','+673 (Brunei)','+359 (Bulgaria)','+226 (Burkina Faso)','+257 (Burundi)',
-      '+855 (Cambodia)','+237 (Cameroon)','+1 (Canada)','+236 (Central African Republic)','+235 (Chad)',
-      '+56 (Chile)','+86 (China)','+57 (Colombia)','+269 (Comoros)','+243 (Congo DR)',
-      '+506 (Costa Rica)','+385 (Croatia)','+53 (Cuba)','+357 (Cyprus)','+420 (Czech Republic)',
-      '+45 (Denmark)','+253 (Djibouti)','+593 (Ecuador)','+20 (Egypt)','+503 (El Salvador)',
-      '+291 (Eritrea)','+372 (Estonia)','+251 (Ethiopia)','+679 (Fiji)','+358 (Finland)',
-      '+33 (France)','+241 (Gabon)','+220 (Gambia)','+995 (Georgia)','+49 (Germany)',
-      '+233 (Ghana)','+30 (Greece)','+502 (Guatemala)','+224 (Guinea)','+592 (Guyana)',
-      '+509 (Haiti)','+504 (Honduras)','+852 (Hong Kong)','+36 (Hungary)','+354 (Iceland)',
-      '+91 (India)','+62 (Indonesia)','+98 (Iran)','+964 (Iraq)','+353 (Ireland)',
-      '+972 (Israel)','+39 (Italy)','+225 (Ivory Coast)','+1876 (Jamaica)','+81 (Japan)',
-      '+962 (Jordan)','+7 (Kazakhstan)','+254 (Kenya)','+965 (Kuwait)','+996 (Kyrgyzstan)',
-      '+856 (Laos)','+371 (Latvia)','+961 (Lebanon)','+231 (Liberia)','+218 (Libya)',
-      '+423 (Liechtenstein)','+370 (Lithuania)','+352 (Luxembourg)','+853 (Macau)',
-      '+261 (Madagascar)','+265 (Malawi)','+60 (Malaysia)','+960 (Maldives)','+223 (Mali)',
-      '+356 (Malta)','+222 (Mauritania)','+230 (Mauritius)','+52 (Mexico)','+373 (Moldova)',
-      '+377 (Monaco)','+976 (Mongolia)','+382 (Montenegro)','+212 (Morocco)','+258 (Mozambique)',
-      '+95 (Myanmar)','+264 (Namibia)','+977 (Nepal)','+31 (Netherlands)','+64 (New Zealand)',
-      '+505 (Nicaragua)','+227 (Niger)','+234 (Nigeria)','+389 (North Macedonia)','+47 (Norway)',
-      '+968 (Oman)','+92 (Pakistan)','+507 (Panama)','+595 (Paraguay)','+51 (Peru)',
-      '+63 (Philippines)','+48 (Poland)','+351 (Portugal)','+974 (Qatar)','+40 (Romania)',
-      '+7 (Russia)','+250 (Rwanda)','+966 (Saudi Arabia)','+221 (Senegal)','+381 (Serbia)',
-      '+65 (Singapore)','+421 (Slovakia)','+386 (Slovenia)','+252 (Somalia)','+27 (South Africa)',
-      '+82 (South Korea)','+211 (South Sudan)','+34 (Spain)','+94 (Sri Lanka)','+249 (Sudan)',
-      '+46 (Sweden)','+41 (Switzerland)','+963 (Syria)','+886 (Taiwan)','+992 (Tajikistan)',
-      '+255 (Tanzania)','+66 (Thailand)','+228 (Togo)','+216 (Tunisia)','+90 (Turkey)',
-      '+993 (Turkmenistan)','+256 (Uganda)','+380 (Ukraine)','+971 (UAE)','+44 (UK)',
-      '+1 (USA)','+598 (Uruguay)','+998 (Uzbekistan)','+58 (Venezuela)','+84 (Vietnam)',
-      '+967 (Yemen)','+260 (Zambia)','+263 (Zimbabwe)'
+      '+93 (Afghanistan)', '+355 (Albania)', '+213 (Algeria)', '+376 (Andorra)', '+244 (Angola)',
+      '+54 (Argentina)', '+374 (Armenia)', '+61 (Australia)', '+43 (Austria)', '+994 (Azerbaijan)',
+      '+973 (Bahrain)', '+880 (Bangladesh)', '+375 (Belarus)', '+32 (Belgium)', '+501 (Belize)',
+      '+229 (Benin)', '+975 (Bhutan)', '+591 (Bolivia)', '+387 (Bosnia)', '+267 (Botswana)',
+      '+55 (Brazil)', '+673 (Brunei)', '+359 (Bulgaria)', '+226 (Burkina Faso)', '+257 (Burundi)',
+      '+855 (Cambodia)', '+237 (Cameroon)', '+1 (Canada)', '+236 (Central African Republic)', '+235 (Chad)',
+      '+56 (Chile)', '+86 (China)', '+57 (Colombia)', '+269 (Comoros)', '+243 (Congo DR)',
+      '+506 (Costa Rica)', '+385 (Croatia)', '+53 (Cuba)', '+357 (Cyprus)', '+420 (Czech Republic)',
+      '+45 (Denmark)', '+253 (Djibouti)', '+593 (Ecuador)', '+20 (Egypt)', '+503 (El Salvador)',
+      '+291 (Eritrea)', '+372 (Estonia)', '+251 (Ethiopia)', '+679 (Fiji)', '+358 (Finland)',
+      '+33 (France)', '+241 (Gabon)', '+220 (Gambia)', '+995 (Georgia)', '+49 (Germany)',
+      '+233 (Ghana)', '+30 (Greece)', '+502 (Guatemala)', '+224 (Guinea)', '+592 (Guyana)',
+      '+509 (Haiti)', '+504 (Honduras)', '+852 (Hong Kong)', '+36 (Hungary)', '+354 (Iceland)',
+      '+91 (India)', '+62 (Indonesia)', '+98 (Iran)', '+964 (Iraq)', '+353 (Ireland)',
+      '+972 (Israel)', '+39 (Italy)', '+225 (Ivory Coast)', '+1876 (Jamaica)', '+81 (Japan)',
+      '+962 (Jordan)', '+7 (Kazakhstan)', '+254 (Kenya)', '+965 (Kuwait)', '+996 (Kyrgyzstan)',
+      '+856 (Laos)', '+371 (Latvia)', '+961 (Lebanon)', '+231 (Liberia)', '+218 (Libya)',
+      '+423 (Liechtenstein)', '+370 (Lithuania)', '+352 (Luxembourg)', '+853 (Macau)',
+      '+261 (Madagascar)', '+265 (Malawi)', '+60 (Malaysia)', '+960 (Maldives)', '+223 (Mali)',
+      '+356 (Malta)', '+222 (Mauritania)', '+230 (Mauritius)', '+52 (Mexico)', '+373 (Moldova)',
+      '+377 (Monaco)', '+976 (Mongolia)', '+382 (Montenegro)', '+212 (Morocco)', '+258 (Mozambique)',
+      '+95 (Myanmar)', '+264 (Namibia)', '+977 (Nepal)', '+31 (Netherlands)', '+64 (New Zealand)',
+      '+505 (Nicaragua)', '+227 (Niger)', '+234 (Nigeria)', '+389 (North Macedonia)', '+47 (Norway)',
+      '+968 (Oman)', '+92 (Pakistan)', '+507 (Panama)', '+595 (Paraguay)', '+51 (Peru)',
+      '+63 (Philippines)', '+48 (Poland)', '+351 (Portugal)', '+974 (Qatar)', '+40 (Romania)',
+      '+7 (Russia)', '+250 (Rwanda)', '+966 (Saudi Arabia)', '+221 (Senegal)', '+381 (Serbia)',
+      '+65 (Singapore)', '+421 (Slovakia)', '+386 (Slovenia)', '+252 (Somalia)', '+27 (South Africa)',
+      '+82 (South Korea)', '+211 (South Sudan)', '+34 (Spain)', '+94 (Sri Lanka)', '+249 (Sudan)',
+      '+46 (Sweden)', '+41 (Switzerland)', '+963 (Syria)', '+886 (Taiwan)', '+992 (Tajikistan)',
+      '+255 (Tanzania)', '+66 (Thailand)', '+228 (Togo)', '+216 (Tunisia)', '+90 (Turkey)',
+      '+993 (Turkmenistan)', '+256 (Uganda)', '+380 (Ukraine)', '+971 (UAE)', '+44 (UK)',
+      '+1 (USA)', '+598 (Uruguay)', '+998 (Uzbekistan)', '+58 (Venezuela)', '+84 (Vietnam)',
+      '+967 (Yemen)', '+260 (Zambia)', '+263 (Zimbabwe)'
     ];
-    codeList.innerHTML = codes.map(function(c) { return '<option value="'+c.split(' ')[0]+'">'+c+'</option>'; }).join('');
-    
+    codeList.innerHTML = codes.map(function (c) { return '<option value="' + c.split(' ')[0] + '">' + c + '</option>'; }).join('');
+
     var codeInp = document.createElement('input');
     codeInp.className = 'pii-inp'; codeInp.placeholder = 'Code'; codeInp.setAttribute('list', 'country-codes');
     codeInp.style.width = '90px'; codeInp.value = '+91';
-    
+
     var phoneInp = document.createElement('input');
     phoneInp.className = 'pii-inp'; phoneInp.placeholder = 'Mobile number *'; phoneInp.type = 'tel'; phoneInp.style.flex = '1';
-    
+
     phoneRow.appendChild(codeList);
     phoneRow.appendChild(codeInp);
     phoneRow.appendChild(phoneInp);
@@ -655,7 +674,7 @@
     msgs.scrollTop = msgs.scrollHeight;
     nameInp.focus();
 
-    submitBtn.addEventListener('click', function() {
+    submitBtn.addEventListener('click', function () {
       var name = nameInp.value.trim();
       var email = emailInp.value.trim();
       var phone = (codeInp.value.trim() + ' ' + phoneInp.value.trim()).trim();
@@ -705,7 +724,7 @@
         method: 'POST',
         headers: authHeaders,
         body: JSON.stringify({ session_id: SESSION_ID, name: name, email: email, phone: phone, consent: true })
-      }).catch(function(){});
+      }).catch(function () { });
 
       // Remove PII card
       card.remove();
@@ -719,30 +738,30 @@
     });
 
     // Also handle Enter key in inputs
-    [nameInp, emailInp, phoneInp].forEach(function(inp) {
-      inp.addEventListener('keydown', function(e) {
+    [nameInp, emailInp, phoneInp].forEach(function (inp) {
+      inp.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') { e.preventDefault(); submitBtn.click(); }
       });
     });
   }
 
   // ── Send message ─────────────────────────────────────────────────
-  inputBox.addEventListener('keydown', function(e) {
+  inputBox.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage(inputBox.value);
     }
   });
-  inputBox.addEventListener('input', function() {
+  inputBox.addEventListener('input', function () {
     inputBox.style.height = 'auto';
     inputBox.style.height = Math.min(inputBox.scrollHeight, 100) + 'px';
   });
-  sendBtn.addEventListener('click', function() { sendMessage(inputBox.value); });
+  sendBtn.addEventListener('click', function () { sendMessage(inputBox.value); });
 
   function sendMessage(text) {
     if (!text || !text.trim()) return;
     text = text.trim();
-    
+
     addMsg('user', text);
     inputBox.value = '';
     inputBox.style.height = 'auto';
@@ -763,10 +782,10 @@
 
     try {
       var chatBody = {
-          session_id: SESSION_ID,
-          message: text,
-          language: langSel ? langSel.value : 'auto',
-          tts_enabled: cfg.tts
+        session_id: SESSION_ID,
+        message: text,
+        language: langSel ? langSel.value : 'auto',
+        tts_enabled: cfg.tts
       };
       // Send client metadata on first message only
       if (!_metaSent) {
@@ -775,7 +794,7 @@
           chatBody.screen_resolution = screen.width + 'x' + screen.height;
           chatBody.page_url = window.location.href;
           chatBody.client_timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        } catch(_e) {}
+        } catch (_e) { }
       }
       const resp = await _authedFetch(API_URL + '/v1/chat', {
         method: 'POST',
@@ -804,7 +823,7 @@
   }
 
   // ── Microphone (Voice-to-Text) ──────────────────────────────────
-  micBtn.addEventListener('click', function() {
+  micBtn.addEventListener('click', function () {
     if (!isRecording) startMicRecording();
     else stopMicRecording();
   });
@@ -815,25 +834,25 @@
       return;
     }
     navigator.mediaDevices.getUserMedia({ audio: true })
-    .then(function(stream) {
-      var mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg';
-      mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
-      audioChunks = [];
-      mediaRecorder.ondataavailable = function(e) {
-        if (e.data.size > 0) audioChunks.push(e.data);
-      };
-      mediaRecorder.onstop = function() {
-        stream.getTracks().forEach(function(t) { t.stop(); });
-        transcribeAudio();
-      };
-      mediaRecorder.start(250);
-      isRecording = true;
-      micBtn.classList.add('recording');
-      micBtn.title = 'Stop recording';
-    })
-    .catch(function() {
-      addMsg('assistant', 'Microphone access denied. Please allow microphone permission.');
-    });
+      .then(function (stream) {
+        var mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg';
+        mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+        audioChunks = [];
+        mediaRecorder.ondataavailable = function (e) {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+        mediaRecorder.onstop = function () {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          transcribeAudio();
+        };
+        mediaRecorder.start(250);
+        isRecording = true;
+        micBtn.classList.add('recording');
+        micBtn.title = 'Stop recording';
+      })
+      .catch(function () {
+        addMsg('assistant', 'Microphone access denied. Please allow microphone permission.');
+      });
   }
 
   function stopMicRecording() {
@@ -852,7 +871,7 @@
 
     // Convert to base64 and send to STT
     var reader = new FileReader();
-    reader.onloadend = async function() {
+    reader.onloadend = async function () {
       var base64 = reader.result.split(',')[1];
       try {
         var resp = await _authedFetch(API_URL + '/v1/stt', {
@@ -867,7 +886,7 @@
           inputBox.style.height = Math.min(inputBox.scrollHeight, 100) + 'px';
           inputBox.focus();
         }
-      } catch(e) {
+      } catch (e) {
         console.error('STT error:', e);
       }
     };
@@ -910,7 +929,7 @@
     }
 
     var reader = new FileReader();
-    reader.onload = function(e) {
+    reader.onload = function (e) {
       addImageMsg(e.target.result);
     };
     reader.readAsDataURL(file);
@@ -934,24 +953,26 @@
   }
 
   // ── Session close ─────────────────────────────────────────────
-  window.addEventListener('beforeunload', function() {
+  window.addEventListener('beforeunload', function () {
     if (msgCount > 0) {
       _authedFetch(API_URL + '/v1/session/close?session_id=' + SESSION_ID, {
         method: 'POST',
         headers: authHeaders,
         keepalive: true
-      }).catch(function(){});
+      }).catch(function () { });
     }
   });
 
   // ── Real-time config sync (polls every 30s) ──────────────────
   var _lastConfigHash = JSON.stringify(cfg);
-  setInterval(async function() {
+  setInterval(async function () {
     try {
-      var syncUrl = companySlug
-        ? API_URL + '/v1/widget/config?slug=' + encodeURIComponent(companySlug)
-        : API_URL + '/v1/widget/config';
-      var res = await fetch(syncUrl, { headers: authHeaders });
+      var res = await apiFetch(
+        companySlug
+          ? '/v1/widget/config?slug=' + encodeURIComponent(companySlug)
+          : '/v1/widget/config',
+        { headers: authHeaders }
+      );
       if (!res.ok) return;
       var newConfig = await res.json();
       var newCfg = {
@@ -982,11 +1003,11 @@
       // Rebuild CSS with new colors
       styleEl.textContent = styleEl.textContent
         .replace(/background:linear-gradient\(135deg,[^)]+\)/g,
-          'background:linear-gradient(135deg,'+cfg.color1+','+cfg.color2+')')
+          'background:linear-gradient(135deg,' + cfg.color1 + ',' + cfg.color2 + ')')
         .replace(/background:#[a-fA-F0-9]{6};color:#[a-fA-F0-9]{6};border-radius:4px/,
-          'background:'+cfg.color1+';color:'+cfg.colorBotText+';border-radius:4px')
+          'background:' + cfg.color1 + ';color:' + cfg.colorBotText + ';border-radius:4px')
         .replace(/background:#[a-fA-F0-9]{6};color:#[a-fA-F0-9]{6};border-radius:16px 4px/,
-          'background:'+cfg.color2+';color:'+cfg.colorUserText+';border-radius:16px 4px');
+          'background:' + cfg.color2 + ';color:' + cfg.colorUserText + ';border-radius:16px 4px');
       var msgsEl = shadow.querySelector('.messages');
       if (msgsEl) {
         msgsEl.style.background = cfg.bgColor;
@@ -1007,14 +1028,13 @@
         if (hdrAvImg) { hdrAvImg.src = cfg.logoUrl; }
         else {
           var avEl = shadow.querySelector('.agent-av');
-          if (avEl) { avEl.innerHTML = '<img src="'+cfg.logoUrl+'" onerror="this.style.display=\'none\'" style="width:100%;height:100%;object-fit:cover;"/>'; }
+          if (avEl) { avEl.innerHTML = '<img src="' + cfg.logoUrl + '" onerror="this.style.display=\'none\'" style="width:100%;height:100%;object-fit:cover;"/>'; }
         }
       }
       var launcherImg = shadow.querySelector('.launcher img.l-img');
       if (cfg.logoUrl && launcherImg) { launcherImg.src = cfg.logoUrl; }
       console.log('[OmniChat] Config refreshed');
-    } catch(e) {}
+    } catch (e) { }
   }, 30000);
 
 })();
-

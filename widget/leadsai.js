@@ -1,7 +1,7 @@
-(async function initOmniChat() {
-  const scriptTag = document.currentScript || document.getElementById("omnichat-embed-script");
+(async function initLeadsAI() {
+  const scriptTag = document.currentScript || document.getElementById("leadsai-embed-script");
   if (!scriptTag) {
-    console.error("OmniChat: Could not locate script tag.");
+    console.error("LeadsAI: Could not locate script tag.");
     return;
   }
 
@@ -44,7 +44,7 @@
         widgetJwt = tokenData.access_token;
       }
     } catch (e) {
-      console.error("OmniChat: Failed to fetch widget token", e);
+      console.error("LeadsAI: Failed to fetch widget token", e);
     }
   } else {
     // Dashboard preview — use the logged-in user's JWT
@@ -79,7 +79,7 @@
         return true;
       }
     } catch (e) {
-      console.error("OmniChat: Token refresh failed", e);
+      console.error("LeadsAI: Token refresh failed", e);
     }
     return false;
   }
@@ -119,7 +119,7 @@
       config = await res.json();
     }
   } catch (e) {
-    console.error("OmniChat: Failed to load config", e);
+    console.error("LeadsAI: Failed to load config", e);
   }
 
   var cfg = {
@@ -163,7 +163,7 @@
 
   // ── Build shadow DOM container ──────────────────────────────────
   var host = document.createElement('div');
-  host.id = 'omnichat-host';
+  host.id = 'leadsai-host';
   host.style.cssText = 'position:fixed;bottom:24px;' + (cfg.position.includes('right') ? 'right:24px' : 'left:24px') + ';z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;';
   document.body.appendChild(host);
   var shadow = host.attachShadow({ mode: 'open' });
@@ -1033,7 +1033,7 @@
       }
       var launcherImg = shadow.querySelector('.launcher img.l-img');
       if (cfg.logoUrl && launcherImg) { launcherImg.src = cfg.logoUrl; }
-      console.log('[OmniChat] Config refreshed');
+      console.log('[LeadsAI] Config refreshed');
     } catch (e) { }
   }, 30000);
 

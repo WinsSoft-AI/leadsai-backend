@@ -98,6 +98,8 @@ SUPERADMIN  (JWT — superadmin)
   POST /superadmin/clients/{client_id}/ticket-limit
   POST /superadmin/clients/{client_id}/force-logout
   POST /superadmin/clients/{client_id}/toggle-domain-verified
+  POST /superadmin/clients/{client_id}/request-email-change
+  POST /superadmin/clients/{client_id}/confirm-email-change
   DELETE /superadmin/clients/{client_id}
   GET  /superadmin/admins
   POST /superadmin/admins
@@ -1926,6 +1928,7 @@ async def delete_document(doc_id: str, current: dict = Depends(get_current_user)
         if not row:
             raise HTTPException(status_code=404, detail="Document not found")
         await conn.execute("DELETE FROM ingest_jobs WHERE id=$1", doc_id)
+        await _audit(conn, current, "delete", "ingest_job", doc_id, {}, tenant_id=current["tenant_id"])
 
     # Remove from RAG engine
     try:
@@ -2321,12 +2324,12 @@ async def verify_domain(current: dict = Depends(get_current_user)):
                 "UPDATE tenants SET verification_token=$1 WHERE id=$2", token, tid
             )
 
-    # Fetch website and search for <meta name="omnichat-verify" content="TOKEN">
+    # Fetch website and search for <meta name="leadsai-verify" content="TOKEN">
     try:
         page = await app.state.ai.scrape_single_page(row["domain"])
         html_content = page.get("html", "") or page.get("content", "") or page.get("text", "")
         match = re.search(
-            rf'<meta\s+name=["\']omnichat-verify["\']\s+content=["\']({re.escape(token)})["\']',
+            rf'<meta\s+name=["\']leadsai-verify["\']\s+content=["\']({re.escape(token)})["\']',
             html_content, re.IGNORECASE
         )
         if match:
@@ -2418,6 +2421,8 @@ async def update_widget_config(body: _WidgetUpdate, current: dict = Depends(get_
             f" WHERE tenant_id=${len(keys)+1}",
             *vals, current["tenant_id"],
         )
+        await _audit(conn, current, "update_widget_config", "widget_config", current["tenant_id"],
+                     {"fields": keys}, tenant_id=current["tenant_id"])
     return {"status": "updated", "fields": keys}
 
 # ── Uploads & Assets ───────────────────────────────────────────────────────────
@@ -2609,6 +2614,7 @@ async def verify_payment(req: _VerifyReq):
         tenant_id=req.tenant_id,
         plan=req.plan,
     )
+    # Note: audit for payment_verified is logged inside payments.verify_payment
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -2738,6 +2744,8 @@ async def update_settings(body: _SettingsUpdate, current: dict = Depends(get_cur
                         "UPDATE tenants SET notification_emails=$1, updated_at=NOW() WHERE id=$2",
                         csv, current["tenant_id"],
                     )
+            await _audit(conn, current, "update_settings", "tenant", current["tenant_id"],
+                         body.model_dump(exclude_none=True), tenant_id=current["tenant_id"])
     return {"status": "updated"}
 
 
@@ -3182,6 +3190,9 @@ async def user_create_ticket(
                 " VALUES ($1,$2,'user','none','open','Ticket created')",
                 tid, current["id"],
             )
+            await _audit(conn, current, "create_ticket", "ticket", tid,
+                         {"heading": heading, "type": type, "priority": priority},
+                         tenant_id=current["tenant_id"])
     return {"ticket_id": tid, "status": "open"}
 
 
@@ -3448,6 +3459,8 @@ async def user_send_message(
             "UPDATE tickets SET unread_admin=unread_admin+1, updated_at=NOW() WHERE id=$1",
             ticket_id,
         )
+        await _audit(conn, current, "send_message", "ticket_message", mid,
+                     {"ticket_id": ticket_id}, tenant_id=current["tenant_id"])
     return {"message_id": mid, "status": "sent"}
 
 
@@ -3483,6 +3496,9 @@ async def user_close_ticket(
             " VALUES ($1,$2,'user',$3,'closed',$4)",
             ticket_id, current["id"], prev, body.note,
         )
+        await _audit(conn, current, "close_ticket", "ticket", ticket_id,
+                     {"from_status": prev, "closure_note": body.note[:100]},
+                     tenant_id=current["tenant_id"])
     return {"status": "closed"}
 
 
@@ -4251,6 +4267,128 @@ async def sa_delete_client(client_id: str, current: dict = Depends(require_super
         await _audit(conn, current, "delete_tenant", "tenant", client_id, {}, tenant_id=client_id)
     await app.state.s3.delete_prefix(f"tenants/{client_id}/")
     return {"status": "deleted"}
+
+
+# ── Superadmin: Change Tenant Email (OTP-verified) ────────────────────────
+
+class _EmailChangeReq(BaseModel):
+    new_email: str
+
+class _EmailChangeConfirm(BaseModel):
+    new_email: str
+    otp: str
+
+@app.post("/superadmin/clients/{client_id}/request-email-change", tags=["SuperAdmin"])
+async def sa_request_email_change(
+    client_id: str, body: _EmailChangeReq, current: dict = Depends(require_superadmin)
+):
+    """Send OTP to the new email for verification. Client shares OTP with superadmin."""
+    import hashlib, json as _json
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow("SELECT email, company FROM tenants WHERE id=$1", client_id)
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        if tenant["email"] == body.new_email:
+            raise HTTPException(status_code=400, detail="New email is same as current email")
+
+        # Check if new email is already in use
+        if await conn.fetchrow("SELECT id FROM tenants WHERE email=$1", body.new_email):
+            raise HTTPException(status_code=409, detail="Email already in use by another tenant")
+        if await conn.fetchrow("SELECT id FROM user_auth WHERE email=$1", body.new_email):
+            raise HTTPException(status_code=409, detail="Email already in use by another user")
+
+        # Generate OTP and store
+        otp_code = f"{secrets.randbelow(900000) + 100000}"
+        otp_hash = hashlib.sha256(otp_code.encode()).hexdigest()
+        otp_id = secrets.token_hex(8)
+        expires_at = datetime.utcnow() + timedelta(minutes=10)
+
+        await conn.execute(
+            "INSERT INTO otps (id, email, otp_hash, purpose, payload, expires_at)"
+            " VALUES ($1, $2, $3, 'sa_email_change', $4, $5)",
+            otp_id, body.new_email, otp_hash,
+            _json.dumps({"tenant_id": client_id, "old_email": tenant["email"]}),
+            expires_at,
+        )
+
+    # Send OTP to new email
+    from lead_manager import send_email
+    html = f"""
+    <div style="font-family:sans-serif;max-width:500px;margin:auto;padding:24px;">
+        <h2 style="color:#2952e3;">Email Change Verification</h2>
+        <p>A request has been made to change the primary email for
+        <strong>{tenant['company'] or 'your account'}</strong> to this address.</p>
+        <p style="font-size:32px;font-weight:bold;letter-spacing:8px;text-align:center;
+                  background:#f3f4f6;padding:16px;border-radius:8px;color:#2952e3;">
+            {otp_code}
+        </p>
+        <p>Please share this code with your account administrator to complete the change.</p>
+        <p style="color:#999;font-size:12px;">This code expires in 10 minutes.</p>
+    </div>
+    """
+    try:
+        await send_email(body.new_email, "Email Change Verification - OTP", html)
+    except Exception as e:
+        logger.error(f"Failed to send email change OTP: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send OTP email")
+
+    return {"status": "otp_sent", "message": f"OTP sent to {body.new_email}"}
+
+
+@app.post("/superadmin/clients/{client_id}/confirm-email-change", tags=["SuperAdmin"])
+async def sa_confirm_email_change(
+    client_id: str, body: _EmailChangeConfirm, current: dict = Depends(require_superadmin)
+):
+    """Verify OTP and update tenant email across all tables."""
+    import hashlib, json as _json
+    otp_hash = hashlib.sha256(body.otp.encode()).hexdigest()
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Verify OTP
+        otp_row = await conn.fetchrow(
+            "SELECT id, payload FROM otps"
+            " WHERE email=$1 AND otp_hash=$2 AND purpose='sa_email_change'"
+            "   AND used=FALSE AND expires_at > NOW()"
+            " ORDER BY created_at DESC LIMIT 1",
+            body.new_email, otp_hash,
+        )
+        if not otp_row:
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+        payload = otp_row["payload"] if isinstance(otp_row["payload"], dict) else _json.loads(otp_row["payload"])
+        if payload.get("tenant_id") != client_id:
+            raise HTTPException(status_code=400, detail="OTP does not match this tenant")
+
+        old_email = payload.get("old_email")
+
+        async with conn.transaction():
+            # Update tenant email
+            await conn.execute(
+                "UPDATE tenants SET email=$1, updated_at=NOW() WHERE id=$2",
+                body.new_email, client_id,
+            )
+            # Update owner user_auth email
+            await conn.execute(
+                "UPDATE user_auth SET email=$1, updated_at=NOW()"
+                " WHERE tenant_id=$2 AND role='owner' AND email=$3",
+                body.new_email, client_id, old_email,
+            )
+            # Update widget notification email
+            await conn.execute(
+                "UPDATE widget_configs SET notification_email=$1, updated_at=NOW()"
+                " WHERE tenant_id=$2",
+                body.new_email, client_id,
+            )
+            # Mark OTP as used
+            await conn.execute("UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"])
+
+            await _audit(conn, current, "change_email", "tenant", client_id,
+                         {"old_email": old_email, "new_email": body.new_email},
+                         tenant_id=client_id)
+
+    return {"status": "email_changed", "new_email": body.new_email}
 
 
 # ── Superadmin Knowledge Base Manager ───────────────────────────────────────

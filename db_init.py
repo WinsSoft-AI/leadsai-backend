@@ -1,5 +1,5 @@
 """
-Leads AI — Database Initialization  v3.1  (PostgreSQL / asyncpg)
+Leads AI — Database Initialization  v4.0  (PostgreSQL / asyncpg)
 =====================================================================
 CLI usage
 ---------
@@ -7,26 +7,26 @@ python db_init.py              # create tables + seed demo data
 python db_init.py --reset      # drop everything, recreate, seed
 python db_init.py --no-seed    # create tables only, skip seed
 
-All settings come from .env — no config.py.
+NOT DEPLOYED TO PRODUCTION — this file contains DDL only.
+Runtime helpers (pool, tenant_conn, hash_password, _audit) live in db.py.
 
-Schema
-------
-CORE        tenants, subscriptions, payments,
-            sessions, leads, ingest_jobs, usage_events, widget_configs
+Schema Architecture
+-------------------
+PUBLIC SCHEMA (platform-level):
+  plans, tenants, subscriptions, billing_cycles, payments,
+  usage_events, user_auth, admin_users, password_reset_tokens, otps,
+  tickets, ticket_attachments, ticket_messages, ticket_status_log,
+  platform_settings, audit_log, tenant_stats
 
-KNOWLEDGE   knowledge_qa, kb_company_data, kb_products
-
-AUTH        user_auth, admin_users, password_reset_tokens, otps
-
-SUPPORT     tickets, ticket_attachments, ticket_messages, ticket_status_log
-
-PLATFORM    platform_settings, audit_log
+TENANT TEMPLATE SCHEMA ('tenant') — cloned as t_{tenant_id} on onboarding:
+  sessions, session_metadata, leads, ingest_jobs,
+  widget_configs, knowledge_qa, kb_company_data, kb_products
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
+
 import logging
 import os
 import secrets
@@ -50,65 +50,17 @@ except ImportError:
     sys.exit(1)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# DSN helper — strips SQLAlchemy prefix so asyncpg can use it directly
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _dsn() -> str:
-    raw = os.environ.get("DATABASE_URL", "")
-    if not raw:
-        logger.error("DATABASE_URL is not set in .env")
-        sys.exit(1)
-    # SQLAlchemy uses postgresql+asyncpg://, asyncpg wants postgresql://
-    return raw.replace("postgresql+asyncpg://", "postgresql://") \
-               .replace("postgres+asyncpg://",   "postgresql://")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CONNECTION POOL (module-level singleton — shared across the whole app)
+# SCHEMA — Schema-per-tenant architecture
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC schema  : platform-level tables (plans, tenants, auth, tickets, etc.)
+# tenant schema  : TEMPLATE — cloned as t_{tenant_id} on onboarding
+# t_{tenant_id}  : per-tenant data (sessions, leads, KB, widget_configs)
 # ═════════════════════════════════════════════════════════════════════════════
 
-_pool: Optional[asyncpg.Pool] = None
-
-
-async def get_pool() -> asyncpg.Pool:
-    """Return (or lazily create) the shared asyncpg connection pool."""
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(
-            dsn=_dsn(),
-            min_size=int(os.getenv("DB_POOL_MIN",     "5")),
-            max_size=int(os.getenv("DB_POOL_MAX",     "20")),
-            command_timeout=float(os.getenv("DB_POOL_TIMEOUT", "30")),
-            init=_init_conn,
-        )
-    return _pool
-
-
-async def close_pool() -> None:
-    global _pool
-    if _pool:
-        await _pool.close()
-        _pool = None
-
-
-async def _init_conn(conn: asyncpg.Connection) -> None:
-    """Register JSONB codec so asyncpg auto-encodes/decodes Python dicts."""
-    import json
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-        format="text",
-    )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SCHEMA — one CREATE TABLE per string so asyncpg can execute them individually
-# ═════════════════════════════════════════════════════════════════════════════
-
-_TABLES: list[str] = [
+_PUBLIC_TABLES: list[str] = [
 
     # ── plans ─────────────────────────────────────────────────────────────────
     """
@@ -159,10 +111,11 @@ _TABLES: list[str] = [
     """,
 
     # ── subscriptions ─────────────────────────────────────────────────────────
+    # NO CASCADE — preserved when tenant is soft-deleted
     """
     CREATE TABLE IF NOT EXISTS subscriptions (
         id                   TEXT        PRIMARY KEY,
-        tenant_id            TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        tenant_id            TEXT        NOT NULL REFERENCES tenants(id),
         plan                 TEXT        NOT NULL,
         status               TEXT        NOT NULL DEFAULT 'active',
         razorpay_sub_id      TEXT        UNIQUE,
@@ -181,8 +134,8 @@ _TABLES: list[str] = [
     """
     CREATE TABLE IF NOT EXISTS billing_cycles (
         id                   TEXT        PRIMARY KEY,
-        tenant_id            TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        subscription_id      TEXT        NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+        tenant_id            TEXT        NOT NULL REFERENCES tenants(id),
+        subscription_id      TEXT        NOT NULL REFERENCES subscriptions(id),
         start_date           TIMESTAMPTZ NOT NULL,
         end_date             TIMESTAMPTZ NOT NULL,
         base_fee_rupee       INTEGER     NOT NULL DEFAULT 1000,
@@ -196,10 +149,11 @@ _TABLES: list[str] = [
     """,
 
     # ── payments ──────────────────────────────────────────────────────────────
+    # NO CASCADE — preserved for accounting after tenant deletion
     """
     CREATE TABLE IF NOT EXISTS payments (
         id                  TEXT        PRIMARY KEY,
-        tenant_id           TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        tenant_id           TEXT        NOT NULL REFERENCES tenants(id),
         subscription_id     TEXT        REFERENCES subscriptions(id),
         razorpay_order_id   TEXT,
         razorpay_payment_id TEXT        UNIQUE,
@@ -213,92 +167,6 @@ _TABLES: list[str] = [
         error_description   TEXT,
         created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-
-    # ── sessions (widget chat sessions) ───────────────────────────────────────
-    """
-    CREATE TABLE IF NOT EXISTS sessions (
-        id            TEXT        PRIMARY KEY,
-        tenant_id     TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        visitor_id    TEXT        NOT NULL,
-        language      TEXT        NOT NULL DEFAULT 'en',
-        message_count INTEGER     NOT NULL DEFAULT 0,
-        pii_collected BOOLEAN     NOT NULL DEFAULT FALSE,
-        lead_id       TEXT,
-        intent        TEXT,
-        sentiment     TEXT,
-        chat_history  JSONB       DEFAULT '[]'::jsonb,
-        notes         TEXT,
-        started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        ended_at      TIMESTAMPTZ,
-        last_active   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-
-    # ── session_metadata ──────────────────────────────────────────────────────
-    """
-    CREATE TABLE IF NOT EXISTS session_metadata (
-        session_id    TEXT        PRIMARY KEY,
-        tenant_id     TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        visitor_name  TEXT        NOT NULL DEFAULT 'Guest',
-        ip_address    TEXT,
-        country       TEXT,
-        city          TEXT,
-        region        TEXT,
-        timezone      TEXT,
-        user_agent    TEXT,
-        browser       TEXT,
-        browser_ver   TEXT,
-        os            TEXT,
-        os_ver        TEXT,
-        device_type   TEXT,
-        screen_res    TEXT,
-        language      TEXT,
-        referrer      TEXT,
-        page_url      TEXT,
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-
-    # ── leads ─────────────────────────────────────────────────────────────────
-    """
-    CREATE TABLE IF NOT EXISTS leads (
-        id                 TEXT        PRIMARY KEY,
-        tenant_id          TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        session_id         TEXT        REFERENCES sessions(id),
-        name               TEXT        NOT NULL,
-        email              TEXT,
-        phone              TEXT,
-        canonical_lead_id  TEXT        REFERENCES leads(id),
-        intent             TEXT,
-        product_interest   TEXT,
-        product_quantities JSONB       DEFAULT '{}'::jsonb,
-        quality            TEXT        NOT NULL DEFAULT 'warm',
-        sentiment          TEXT        NOT NULL DEFAULT 'neutral',
-        notes              TEXT,
-        email_sent         BOOLEAN     NOT NULL DEFAULT FALSE,
-        is_merged          BOOLEAN     NOT NULL DEFAULT FALSE,
-        merge_count        INTEGER     NOT NULL DEFAULT 0,
-        merged_session_ids TEXT[]      DEFAULT '{}',
-        merged_names       TEXT[]      DEFAULT '{}',
-        created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-
-    # ── ingest_jobs ───────────────────────────────────────────────────────────
-    """
-    CREATE TABLE IF NOT EXISTS ingest_jobs (
-        id              TEXT        PRIMARY KEY,
-        tenant_id       TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        filename        TEXT        NOT NULL,
-        file_size_bytes INTEGER,
-        content_type    TEXT,
-        status          TEXT        NOT NULL DEFAULT 'processing',
-        chunks_indexed  INTEGER     NOT NULL DEFAULT 0,
-        error_message   TEXT,
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        completed_at    TIMESTAMPTZ
     )
     """,
 
@@ -318,40 +186,11 @@ _TABLES: list[str] = [
     )
     """,
 
-    # ── widget_configs ────────────────────────────────────────────────────────
-    """
-    CREATE TABLE IF NOT EXISTS widget_configs (
-        tenant_id          TEXT        PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
-        name               TEXT,
-        greeting           TEXT        NOT NULL DEFAULT 'Hi! How can I help you today?',
-        primary_color      TEXT        NOT NULL DEFAULT '#2952e3',
-        accent_color       TEXT        NOT NULL DEFAULT '#00d4f5',
-        secondary_color    TEXT        NOT NULL DEFAULT '#ffffff',
-        text_color         TEXT        NOT NULL DEFAULT '#000000',
-        bot_text_color     TEXT        NOT NULL DEFAULT '#ffffff',
-        user_text_color    TEXT        NOT NULL DEFAULT '#ffffff',
-        bg_image_url       TEXT,
-        position           TEXT        NOT NULL DEFAULT 'bottom-right',
-        logo_url           TEXT,
-        proactive_enabled  BOOLEAN     NOT NULL DEFAULT TRUE,
-        proactive_delay_s  INTEGER     NOT NULL DEFAULT 30,
-        proactive_message  TEXT        NOT NULL DEFAULT 'Hi there! Need help? Chat with us!',
-        pii_after_messages INTEGER     NOT NULL DEFAULT 3,
-        tts_enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
-        stt_enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
-        cv_search_enabled  BOOLEAN     NOT NULL DEFAULT TRUE,
-        notification_email TEXT,
-        languages          TEXT        NOT NULL DEFAULT 'en',
-        updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-
     # ── user_auth (tenant dashboard logins) ───────────────────────────────────
-    # role: owner (full access) | member (limited)
     """
     CREATE TABLE IF NOT EXISTS user_auth (
         id            TEXT        PRIMARY KEY,
-        tenant_id     TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        tenant_id     TEXT        NOT NULL REFERENCES tenants(id),
         name          TEXT        NOT NULL,
         email         TEXT        NOT NULL UNIQUE,
         phone         TEXT,
@@ -365,9 +204,7 @@ _TABLES: list[str] = [
     )
     """,
 
-    # ── admin_users (Leads AI internal staff) ────────────────────────────────────────────────
-    # role: admin (claim/resolve tickets, view clients)
-    #       superadmin (full control; CANNOT claim or chat in tickets)
+    # ── admin_users ───────────────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS admin_users (
         id            TEXT        PRIMARY KEY,
@@ -396,16 +233,11 @@ _TABLES: list[str] = [
     )
     """,
 
-    # ── tickets ───────────────────────────────────────────────────────────────
-    # Status flow:
-    #   open  → claimed (admin claims it)
-    #   open  → closed  (user closes, closure_note required)
-    #   claimed → solved (admin resolves, resolution_note required)
-    #   claimed → closed (user closes, closure_note required)
+    # ── tickets (NO CASCADE — preserved for platform records) ─────────────────
     """
     CREATE TABLE IF NOT EXISTS tickets (
         id              TEXT        PRIMARY KEY,
-        tenant_id       TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        tenant_id       TEXT        NOT NULL REFERENCES tenants(id),
         user_id         TEXT        NOT NULL REFERENCES user_auth(id),
         heading         TEXT        NOT NULL,
         context         TEXT        NOT NULL,
@@ -437,8 +269,6 @@ _TABLES: list[str] = [
     """,
 
     # ── ticket_messages ───────────────────────────────────────────────────────
-    # Chat between tenant user and admin inside a ticket thread.
-    # Users can only send once ticket is 'claimed'.
     """
     CREATE TABLE IF NOT EXISTS ticket_messages (
         id          TEXT        PRIMARY KEY,
@@ -452,7 +282,7 @@ _TABLES: list[str] = [
     )
     """,
 
-    # ── ticket_status_log (immutable audit trail) ─────────────────────────────
+    # ── ticket_status_log ─────────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS ticket_status_log (
         id           BIGSERIAL   PRIMARY KEY,
@@ -466,7 +296,7 @@ _TABLES: list[str] = [
     )
     """,
 
-    # ── platform_settings (superadmin key/value store) ────────────────────────
+    # ── platform_settings ─────────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS platform_settings (
         key        TEXT        PRIMARY KEY,
@@ -476,7 +306,7 @@ _TABLES: list[str] = [
     )
     """,
 
-    # ── audit_log (every admin/superadmin action) ─────────────────────────────
+    # ── audit_log ─────────────────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS audit_log (
         id          BIGSERIAL   PRIMARY KEY,
@@ -491,54 +321,7 @@ _TABLES: list[str] = [
     )
     """,
 
-    # ── knowledge_qa (table for custom Q/A) ──────────────────────────────────
-    """
-    CREATE TABLE IF NOT EXISTS knowledge_qa (
-        id          TEXT        PRIMARY KEY,
-        tenant_id   TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        question    TEXT        NOT NULL,
-        answer      TEXT        NOT NULL,
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-
-    # ── kb_company_data (structured company info per tenant) ───────────────────
-    """
-    CREATE TABLE IF NOT EXISTS kb_company_data (
-        id               TEXT        PRIMARY KEY,
-        tenant_id        TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        section          TEXT        NOT NULL,
-        field_key        TEXT        NOT NULL,
-        field_value      TEXT        NOT NULL DEFAULT '',
-        display_order    INTEGER     NOT NULL DEFAULT 0,
-        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(tenant_id, section, field_key)
-    )
-    """,
-
-    # ── kb_products (product catalog per tenant) ──────────────────────────────
-    """
-    CREATE TABLE IF NOT EXISTS kb_products (
-        id               TEXT        PRIMARY KEY,
-        tenant_id        TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        category         TEXT        NOT NULL DEFAULT '',
-        sub_category     TEXT        NOT NULL DEFAULT '',
-        name             TEXT        NOT NULL,
-        description      TEXT        NOT NULL DEFAULT '',
-        image_url        TEXT,
-        pricing          TEXT,
-        min_order_qty    TEXT,
-        source_url       TEXT,
-        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-
-    # ── otps (generic OTP table for all purposes) ─────────────────────────────
-    # purpose: 'registration' | 'change_password' | 'member_invite' | ...
-    # payload: JSONB storing purpose-specific data (e.g. registration fields)
+    # ── otps ──────────────────────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS otps (
         id            TEXT        PRIMARY KEY,
@@ -551,16 +334,181 @@ _TABLES: list[str] = [
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
+
+    # ── tenant_stats (summary cache for admin analytics) ──────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS tenant_stats (
+        tenant_id       TEXT        PRIMARY KEY REFERENCES tenants(id),
+        total_sessions  INTEGER     NOT NULL DEFAULT 0,
+        total_leads     INTEGER     NOT NULL DEFAULT 0,
+        hot_leads       INTEGER     NOT NULL DEFAULT 0,
+        warm_leads      INTEGER     NOT NULL DEFAULT 0,
+        cold_leads      INTEGER     NOT NULL DEFAULT 0,
+        total_messages  INTEGER     NOT NULL DEFAULT 0,
+        total_tickets   INTEGER     NOT NULL DEFAULT 0,
+        last_session_at TIMESTAMPTZ,
+        last_lead_at    TIMESTAMPTZ,
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
 ]
 
-_INDEXES: list[str] = [
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TENANT SCHEMA TABLES — created in 'tenant' template schema by init_db,
+# cloned as t_{tenant_id} on onboarding via create_tenant_schema().
+# No FK to public.tenants — schema boundary provides isolation.
+# tenant_id column kept for backward compat (redundant but harmless).
+# ═════════════════════════════════════════════════════════════════════════════
+
+_TENANT_TABLES: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        id            TEXT        PRIMARY KEY,
+        tenant_id     TEXT        NOT NULL,
+        visitor_id    TEXT        NOT NULL,
+        language      TEXT        NOT NULL DEFAULT 'en',
+        message_count INTEGER     NOT NULL DEFAULT 0,
+        pii_collected BOOLEAN     NOT NULL DEFAULT FALSE,
+        lead_id       TEXT,
+        intent        TEXT,
+        sentiment     TEXT,
+        chat_history  JSONB       DEFAULT '[]'::jsonb,
+        notes         TEXT,
+        started_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ended_at      TIMESTAMPTZ,
+        last_active   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS session_metadata (
+        session_id    TEXT        PRIMARY KEY,
+        tenant_id     TEXT        NOT NULL,
+        visitor_name  TEXT        NOT NULL DEFAULT 'Guest',
+        ip_address    TEXT,
+        country       TEXT,
+        city          TEXT,
+        region        TEXT,
+        timezone      TEXT,
+        user_agent    TEXT,
+        browser       TEXT,
+        browser_ver   TEXT,
+        os            TEXT,
+        os_ver        TEXT,
+        device_type   TEXT,
+        screen_res    TEXT,
+        language      TEXT,
+        referrer      TEXT,
+        page_url      TEXT,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS leads (
+        id                 TEXT        PRIMARY KEY,
+        tenant_id          TEXT        NOT NULL,
+        session_id         TEXT        REFERENCES sessions(id),
+        name               TEXT        NOT NULL,
+        email              TEXT,
+        phone              TEXT,
+        canonical_lead_id  TEXT        REFERENCES leads(id),
+        intent             TEXT,
+        product_interest   TEXT,
+        product_quantities JSONB       DEFAULT '{}'::jsonb,
+        quality            TEXT        NOT NULL DEFAULT 'warm',
+        sentiment          TEXT        NOT NULL DEFAULT 'neutral',
+        notes              TEXT,
+        email_sent         BOOLEAN     NOT NULL DEFAULT FALSE,
+        is_merged          BOOLEAN     NOT NULL DEFAULT FALSE,
+        merge_count        INTEGER     NOT NULL DEFAULT 0,
+        merged_session_ids TEXT[]      DEFAULT '{}',
+        merged_names       TEXT[]      DEFAULT '{}',
+        created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_jobs (
+        id              TEXT        PRIMARY KEY,
+        tenant_id       TEXT        NOT NULL,
+        filename        TEXT        NOT NULL,
+        file_size_bytes INTEGER,
+        content_type    TEXT,
+        status          TEXT        NOT NULL DEFAULT 'processing',
+        chunks_indexed  INTEGER     NOT NULL DEFAULT 0,
+        error_message   TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at    TIMESTAMPTZ
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS widget_configs (
+        tenant_id          TEXT        PRIMARY KEY,
+        name               TEXT,
+        greeting           TEXT        NOT NULL DEFAULT 'Hi! How can I help you today?',
+        primary_color      TEXT        NOT NULL DEFAULT '#2952e3',
+        accent_color       TEXT        NOT NULL DEFAULT '#00d4f5',
+        secondary_color    TEXT        NOT NULL DEFAULT '#ffffff',
+        text_color         TEXT        NOT NULL DEFAULT '#000000',
+        bot_text_color     TEXT        NOT NULL DEFAULT '#ffffff',
+        user_text_color    TEXT        NOT NULL DEFAULT '#ffffff',
+        bg_image_url       TEXT,
+        position           TEXT        NOT NULL DEFAULT 'bottom-right',
+        logo_url           TEXT,
+        proactive_enabled  BOOLEAN     NOT NULL DEFAULT TRUE,
+        proactive_delay_s  INTEGER     NOT NULL DEFAULT 30,
+        proactive_message  TEXT        NOT NULL DEFAULT 'Hi there! Need help? Chat with us!',
+        pii_after_messages INTEGER     NOT NULL DEFAULT 3,
+        tts_enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
+        stt_enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
+        cv_search_enabled  BOOLEAN     NOT NULL DEFAULT TRUE,
+        notification_email TEXT,
+        languages          TEXT        NOT NULL DEFAULT 'en',
+        updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_qa (
+        id          TEXT        PRIMARY KEY,
+        tenant_id   TEXT        NOT NULL,
+        question    TEXT        NOT NULL,
+        answer      TEXT        NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS kb_company_data (
+        id               TEXT        PRIMARY KEY,
+        tenant_id        TEXT        NOT NULL,
+        section          TEXT        NOT NULL,
+        field_key        TEXT        NOT NULL,
+        field_value      TEXT        NOT NULL DEFAULT '',
+        display_order    INTEGER     NOT NULL DEFAULT 0,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(tenant_id, section, field_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS kb_products (
+        id               TEXT        PRIMARY KEY,
+        tenant_id        TEXT        NOT NULL,
+        category         TEXT        NOT NULL DEFAULT '',
+        sub_category     TEXT        NOT NULL DEFAULT '',
+        name             TEXT        NOT NULL,
+        description      TEXT        NOT NULL DEFAULT '',
+        image_url        TEXT,
+        pricing          TEXT,
+        min_order_qty    TEXT,
+        source_url       TEXT,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+]
+
+_PUBLIC_INDEXES: list[str] = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_widget_slug ON tenants(widget_slug) WHERE widget_slug IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_tenant       ON sessions(tenant_id)",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_visitor      ON sessions(visitor_id)",
-    "CREATE INDEX IF NOT EXISTS idx_leads_tenant          ON leads(tenant_id)",
-    "CREATE INDEX IF NOT EXISTS idx_leads_email           ON leads(email)",
-    "CREATE INDEX IF NOT EXISTS idx_leads_canonical       ON leads(canonical_lead_id)",
-    "CREATE INDEX IF NOT EXISTS idx_leads_created         ON leads(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_tenant          ON usage_events(tenant_id)",
     "CREATE INDEX IF NOT EXISTS idx_usage_created         ON usage_events(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_payments_tenant       ON payments(tenant_id)",
@@ -580,111 +528,100 @@ _INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_audit_entity          ON audit_log(entity_type, entity_id)",
     "CREATE INDEX IF NOT EXISTS idx_audit_created         ON audit_log(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_pwd_reset_hash        ON password_reset_tokens(token_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_otp_email             ON otps(email)",
+    "CREATE INDEX IF NOT EXISTS idx_otp_purpose           ON otps(email, purpose)",
+]
+
+# Indexes for tenant schema tables — applied to both the template and each tenant schema
+_TENANT_INDEXES: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_sessions_tenant       ON sessions(tenant_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_visitor      ON sessions(visitor_id)",
+    "CREATE INDEX IF NOT EXISTS idx_leads_tenant          ON leads(tenant_id)",
+    "CREATE INDEX IF NOT EXISTS idx_leads_email           ON leads(email)",
+    "CREATE INDEX IF NOT EXISTS idx_leads_canonical       ON leads(canonical_lead_id)",
+    "CREATE INDEX IF NOT EXISTS idx_leads_created         ON leads(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_qa_tenant   ON knowledge_qa(tenant_id)",
     "CREATE INDEX IF NOT EXISTS idx_kb_company_tenant     ON kb_company_data(tenant_id)",
     "CREATE INDEX IF NOT EXISTS idx_kb_products_tenant    ON kb_products(tenant_id)",
     "CREATE INDEX IF NOT EXISTS idx_kb_products_cat       ON kb_products(tenant_id, category)",
-    "CREATE INDEX IF NOT EXISTS idx_otp_email             ON otps(email)",
-    "CREATE INDEX IF NOT EXISTS idx_otp_purpose            ON otps(email, purpose)",
+]
+
+# Tenant table names — used by db.py create_tenant_schema() to clone from template
+TENANT_TABLE_NAMES: list[str] = [
+    "sessions", "session_metadata", "leads", "ingest_jobs",
+    "widget_configs", "knowledge_qa", "kb_company_data", "kb_products",
 ]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PASSWORD & KEY HELPERS
+# INIT — creates public schema + 'tenant' template schema
 # ═════════════════════════════════════════════════════════════════════════════
-
-# hash_api_key removed — domain-based auth does not need key hashing
-
-
-def hash_password(password: str) -> str:
-    """PBKDF2-HMAC-SHA256 — no bcrypt dependency needed."""
-    salt = secrets.token_hex(16)
-    dk   = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
-    return f"pbkdf2$sha256$260000${salt}${dk.hex()}"
-
-
-def verify_password(password: str, stored: str) -> bool:
-    """Constant-time verification against a stored PBKDF2 hash."""
-    try:
-        _, algo, iters, salt, dk_hex = stored.split("$")
-        dk = hashlib.pbkdf2_hmac(algo, password.encode(), salt.encode(), int(iters))
-        return secrets.compare_digest(dk.hex(), dk_hex)
-    except Exception:
-        return False
-
-
-# Plan-driven defaults — also written to platform_settings at seed time
-# Plan ticket limits are now driven by the 'plans' table.
-# Default limits for trial accounts:
-TRIAL_TICKET_LIMIT = 2
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# INIT
-# ═════════════════════════════════════════════════════════════════════════════
-
-async def _audit(conn, actor: dict, action: str, entity_type: str, entity_id: str, meta: dict = {}, tenant_id: Optional[str] = None):
-    """
-    Generic audit logging.
-    Actor: dict from get_current_user (id, role/account_type)
-    """
-    try:
-        actor_id   = actor.get("id")
-        actor_role = actor.get("role") or actor.get("account_type")
-        await conn.execute(
-            "INSERT INTO audit_log (id, actor_id, actor_role, action, entity_type, entity_id, meta, tenant_id)"
-            " VALUES (DEFAULT, $1, $2, $3, $4, $5, $6, $7)",
-            actor_id, actor_role, action, entity_type, entity_id, json.dumps(meta), tenant_id
-        )
-        logger.info(f"Audit: {actor_role}:{actor_id} -> {action} {entity_type}:{entity_id}")
-    except Exception as e:
-        logger.error(f"Audit log failed: {e}")
-
 
 async def init_db(reset: bool = False, seed: bool = True) -> None:
+    from db import get_pool, create_tenant_schema
     pool = await get_pool()
 
     async with pool.acquire() as conn:
         async with conn.transaction():
             if reset:
+                # Drop ALL tenant schemas first
+                schemas = await conn.fetch(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name LIKE 't_%' OR schema_name = 'tenant'"
+                )
+                for row in schemas:
+                    await conn.execute(f'DROP SCHEMA IF EXISTS "{row["schema_name"]}" CASCADE')
+                logger.info(f"  Dropped {len(schemas)} tenant schema(s)")
+
+                # Drop public tables in dependency order
                 drops = [
+                    "tenant_stats",
                     "audit_log", "platform_settings",
                     "ticket_status_log", "ticket_messages",
                     "ticket_attachments", "tickets",
                     "password_reset_tokens", "otps",
                     "admin_users", "user_auth",
-                    "usage_events", "widget_configs", "ingest_jobs", "knowledge_qa",
-                    "kb_products", "kb_company_data", "scrape_jobs", "leads",
-                    "sessions", "payments", "subscriptions", "tenants", "plans",
+                    "usage_events",
+                    "billing_cycles", "payments", "subscriptions",
+                    "tenants", "plans",
                 ]
                 for t in drops:
                     await conn.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
-                logger.info("  All tables dropped")
+                logger.info("  All public tables dropped")
 
-            for stmt in _TABLES:
+            # ── Create public schema tables ──────────────────────────────
+            for stmt in _PUBLIC_TABLES:
                 await conn.execute(stmt)
-            
-            # Ensure tenant_id exists before indexing it
-            await conn.execute("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS tenant_id TEXT")
-
-            # ── Schema migrations for existing databases ──────────────────────
-            await conn.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS domain_verified BOOLEAN NOT NULL DEFAULT FALSE")
-            await conn.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS verification_token TEXT")
-            await conn.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspension_reason TEXT")
-
-            for stmt in _INDEXES:
+            for stmt in _PUBLIC_INDEXES:
                 await conn.execute(stmt)
+
+            # ── Create 'tenant' template schema ──────────────────────────
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS tenant")
+            for stmt in _TENANT_TABLES:
+                tpl = stmt.replace(
+                    "CREATE TABLE IF NOT EXISTS ",
+                    "CREATE TABLE IF NOT EXISTS tenant."
+                )
+                await conn.execute(tpl)
+            for idx in _TENANT_INDEXES:
+                tpl = idx.replace(" ON ", " ON tenant.")
+                await conn.execute(tpl)
+            logger.info("  ✅ Template schema 'tenant' created")
 
     logger.info("✅ Schema applied")
 
     if seed:
-        await _seed(pool)
+        await _seed(pool, create_tenant_schema)
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
         )
-        logger.info(f"📋 Tables ({len(rows)}): {', '.join(r['tablename'] for r in rows)}")
+        logger.info(f"📋 Public tables ({len(rows)}): {', '.join(r['tablename'] for r in rows)}")
+        schemas = await conn.fetch(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 't_%'"
+        )
+        logger.info(f"📋 Tenant schemas: {len(schemas)}")
 
     logger.info("🎉 Database ready!")
 
@@ -693,7 +630,8 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
 # SEED
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def _seed(pool: asyncpg.Pool) -> None:
+async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
+    from db import hash_password
     async with pool.acquire() as conn:
         async with conn.transaction():
 
@@ -787,8 +725,6 @@ async def _seed(pool: asyncpg.Pool) -> None:
                     tid, demo_email,
                 )
 
-                # No needed — widget uses JWT auth
-
                 sub = secrets.token_hex(8)
                 await conn.execute(
                     "INSERT INTO subscriptions"
@@ -798,13 +734,21 @@ async def _seed(pool: asyncpg.Pool) -> None:
                     sub, tid, now, end,
                 )
 
+                # Create tenant schema and insert widget_configs there
+                await create_tenant_schema(conn, tid)
                 await conn.execute(
-                    "INSERT INTO widget_configs"
+                    f'INSERT INTO "t_{tid}".widget_configs'
                     " (tenant_id,name,greeting,notification_email)"
                     " VALUES ($1,'Demo Store',$2,$3)",
                     tid,
                     "Hi! I'm your AI assistant. How can I help?",
                     demo_email,
+                )
+
+                # tenant_stats row
+                await conn.execute(
+                    "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
+                    " ON CONFLICT (tenant_id) DO NOTHING", tid
                 )
 
                 ua = secrets.token_hex(8)
@@ -833,8 +777,11 @@ async def _seed(pool: asyncpg.Pool) -> None:
                     " VALUES ($1,'Test Shop',$2,'Test Ltd','starter','active',2)",
                     st, st_email,
                 )
+
+                # Create tenant schema and insert widget_configs
+                await create_tenant_schema(conn, st)
                 await conn.execute(
-                    "INSERT INTO widget_configs (tenant_id,name,notification_email)"
+                    f'INSERT INTO "t_{st}".widget_configs (tenant_id,name,notification_email)'
                     " VALUES ($1,'Test Shop',$2)",
                     st, st_email,
                 )
@@ -851,6 +798,13 @@ async def _seed(pool: asyncpg.Pool) -> None:
                     " VALUES ($1,$2,'Shop Owner',$3,$4,'owner')",
                     secrets.token_hex(8), st, st_email, hash_password("Test123!"),
                 )
+
+                # tenant_stats row
+                await conn.execute(
+                    "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
+                    " ON CONFLICT (tenant_id) DO NOTHING", st
+                )
+
                 logger.info("  ✅ test@shop.com / Test123!  (Starter plan)")
             
             # ── test ticket with attachment ──────────────────────────────────
@@ -886,6 +840,7 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     async def _run():
+        from db import close_pool
         await init_db(reset=args.reset, seed=not args.no_seed)
         await close_pool()
 

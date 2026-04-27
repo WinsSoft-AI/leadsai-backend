@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 import asyncpg
 from dotenv import load_dotenv
 
-from db_init import get_pool
+from db import get_pool
 
 load_dotenv()
 

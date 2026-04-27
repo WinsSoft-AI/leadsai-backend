@@ -10,7 +10,7 @@ load_dotenv(override=True)
 # Important to modify DEV_MODE for script if running locally, or rely on .env
 # We need `boto3` for actual upload
 from s3 import create_storage_service, S3StorageService
-from db_init import get_pool, close_pool
+from db import get_pool, close_pool
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")

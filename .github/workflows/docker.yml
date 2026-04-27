@@ -1,0 +1,34 @@
+name: Build Backend Image
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push image
+        run: |
+          # Convert the repository name to lowercase
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_URL="ghcr.io/${REPO_LOWER}/backend:latest"
+          
+          echo "Building image: $IMAGE_URL"
+          docker build -t $IMAGE_URL .
+          
+          echo "Pushing image: $IMAGE_URL"
+          docker push $IMAGE_URL

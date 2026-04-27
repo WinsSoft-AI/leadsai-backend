@@ -36,11 +36,12 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
 
-from db_init import (
+from db import (
     get_pool,
     hash_password,
     verify_password,
     _audit,
+    create_tenant_schema,
 )
 from payments import get_plan
 
@@ -508,10 +509,18 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
                 secrets.token_hex(8), tid, now, end,
             )
 
+            # Create tenant schema and insert widget_configs there
+            await create_tenant_schema(conn, tid)
             await conn.execute(
-                "INSERT INTO widget_configs (tenant_id,name,notification_email,logo_url)"
+                f'INSERT INTO "t_{tid}".widget_configs (tenant_id,name,notification_email,logo_url)'
                 " VALUES ($1,$2,$3,$4)",
                 tid, c_name, req.email, logo_url,
+            )
+            
+            # Initialize tenant_stats
+            await conn.execute(
+                "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
+                " ON CONFLICT (tenant_id) DO NOTHING", tid
             )
 
             uid = secrets.token_hex(8)

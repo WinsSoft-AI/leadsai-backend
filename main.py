@@ -146,10 +146,11 @@ from auth import (
     get_current_user, require_admin, require_superadmin,
     router as auth_router,
 )
-from db_init import (
+from db import (
     close_pool, get_pool, hash_password,
-    init_db, _audit,
+    _audit, tenant_conn,
 )
+from db_init import init_db
 from payments import get_plan, RazorpayService
 from ai_proxy import AIProxy
 from lead_manager import LeadManager, SessionStore   # SessionStore lives in lead_manager.py

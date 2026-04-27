@@ -1,5 +1,5 @@
 """
-Leads AI — Database Initialization  v3.1  (PostgreSQL / asyncpg)
+Leads AI — Database Initialization  v4.0  (PostgreSQL / asyncpg)
 =====================================================================
 CLI usage
 ---------
@@ -7,26 +7,26 @@ python db_init.py              # create tables + seed demo data
 python db_init.py --reset      # drop everything, recreate, seed
 python db_init.py --no-seed    # create tables only, skip seed
 
-All settings come from .env — no config.py.
+NOT DEPLOYED TO PRODUCTION — this file contains DDL only.
+Runtime helpers (pool, tenant_conn, hash_password, _audit) live in db.py.
 
-Schema
-------
-CORE        tenants, subscriptions, payments,
-            sessions, leads, ingest_jobs, usage_events, widget_configs
+Schema Architecture
+-------------------
+PUBLIC SCHEMA (platform-level):
+  plans, tenants, subscriptions, billing_cycles, payments,
+  usage_events, user_auth, admin_users, password_reset_tokens, otps,
+  tickets, ticket_attachments, ticket_messages, ticket_status_log,
+  platform_settings, audit_log, tenant_stats
 
-KNOWLEDGE   knowledge_qa, kb_company_data, kb_products
-
-AUTH        user_auth, admin_users, password_reset_tokens, otps
-
-SUPPORT     tickets, ticket_attachments, ticket_messages, ticket_status_log
-
-PLATFORM    platform_settings, audit_log
+TENANT TEMPLATE SCHEMA ('tenant') — cloned as t_{tenant_id} on onboarding:
+  sessions, session_metadata, leads, ingest_jobs,
+  widget_configs, knowledge_qa, kb_company_data, kb_products
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
+
 import logging
 import os
 import secrets
@@ -35,7 +35,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from db import hash_password
+from db import hash_password, close_pool, get_pool, create_tenant_schema
 
 from dotenv import load_dotenv
 
@@ -51,58 +51,7 @@ except ImportError:
     sys.exit(1)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# DSN helper — strips SQLAlchemy prefix so asyncpg can use it directly
-# ═════════════════════════════════════════════════════════════════════════════
 
-def _dsn() -> str:
-    raw = os.environ.get("DATABASE_URL", "")
-    if not raw:
-        logger.error("DATABASE_URL is not set in .env")
-        sys.exit(1)
-    # SQLAlchemy uses postgresql+asyncpg://, asyncpg wants postgresql://
-    return raw.replace("postgresql+asyncpg://", "postgresql://") \
-               .replace("postgres+asyncpg://",   "postgresql://")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# CONNECTION POOL (module-level singleton — shared across the whole app)
-# ═════════════════════════════════════════════════════════════════════════════
-
-_pool: Optional[asyncpg.Pool] = None
-
-
-async def get_pool() -> asyncpg.Pool:
-    """Return (or lazily create) the shared asyncpg connection pool."""
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(
-            dsn=_dsn(),
-            min_size=int(os.getenv("DB_POOL_MIN",     "5")),
-            max_size=int(os.getenv("DB_POOL_MAX",     "20")),
-            command_timeout=float(os.getenv("DB_POOL_TIMEOUT", "30")),
-            init=_init_conn,
-        )
-    return _pool
-
-
-async def close_pool() -> None:
-    global _pool
-    if _pool:
-        await _pool.close()
-        _pool = None
-
-
-async def _init_conn(conn: asyncpg.Connection) -> None:
-    """Register JSONB codec so asyncpg auto-encodes/decodes Python dicts."""
-    import json
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-        format="text",
-    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -611,7 +560,6 @@ TENANT_TABLE_NAMES: list[str] = [
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def init_db(reset: bool = False, seed: bool = True) -> None:
-    from db import get_pool, create_tenant_schema
     pool = await get_pool()
 
     async with pool.acquire() as conn:
@@ -626,20 +574,12 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
                     await conn.execute(f'DROP SCHEMA IF EXISTS "{row["schema_name"]}" CASCADE')
                 logger.info(f"  Dropped {len(schemas)} tenant schema(s)")
 
-                # Drop public tables in dependency order
-                drops = [
-                    "tenant_stats",
-                    "audit_log", "platform_settings",
-                    "ticket_status_log", "ticket_messages",
-                    "ticket_attachments", "tickets",
-                    "password_reset_tokens", "otps",
-                    "admin_users", "user_auth",
-                    "usage_events",
-                    "billing_cycles", "payments", "subscriptions",
-                    "tenants", "plans",
-                ]
-                for t in drops:
-                    await conn.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+                # Drop all public tables dynamically
+                pub_tables = await conn.fetch(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                )
+                for pt in pub_tables:
+                    await conn.execute(f'DROP TABLE IF EXISTS "{pt["tablename"]}" CASCADE')
                 logger.info("  All public tables dropped")
 
             # ── Create public schema tables ──────────────────────────────
@@ -650,15 +590,14 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
 
             # ── Create 'tenant' template schema ──────────────────────────
             await conn.execute("CREATE SCHEMA IF NOT EXISTS tenant")
-            for stmt in _TENANT_TABLES:
-                tpl = stmt.replace(
-                    "CREATE TABLE IF NOT EXISTS ",
-                    "CREATE TABLE IF NOT EXISTS tenant."
-                )
-                await conn.execute(tpl)
-            for idx in _TENANT_INDEXES:
-                tpl = idx.replace(" ON ", " ON tenant.")
-                await conn.execute(tpl)
+            await conn.execute("SET search_path TO tenant, public")
+            try:
+                for stmt in _TENANT_TABLES:
+                    await conn.execute(stmt)
+                for idx in _TENANT_INDEXES:
+                    await conn.execute(idx)
+            finally:
+                await conn.execute("SET search_path TO public")
             logger.info("  ✅ Template schema 'tenant' created")
 
     logger.info("✅ Schema applied")
@@ -683,7 +622,7 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
 # SEED
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def _seed(pool: asyncpg.Pool) -> None:
+async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
     async with pool.acquire() as conn:
         async with conn.transaction():
 
@@ -787,14 +726,22 @@ async def _seed(pool: asyncpg.Pool) -> None:
                     " VALUES ($1,$2,'pro','active',7900,$3,$4)",
                     sub, tid, now, end,
                 )
-
+                
+                # Create tenant schema and insert widget_configs there
+                await create_tenant_schema(conn, tid)
                 await conn.execute(
-                    "INSERT INTO widget_configs"
+                    f'INSERT INTO "t_{tid}".widget_configs'
                     " (tenant_id,name,greeting,notification_email)"
                     " VALUES ($1,'Demo Store',$2,$3)",
                     tid,
                     "Hi! I'm your AI assistant. How can I help?",
                     demo_email,
+                )
+
+                # tenant_stats row
+                await conn.execute(
+                    "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
+                    " ON CONFLICT (tenant_id) DO NOTHING", tid
                 )
 
                 ua = secrets.token_hex(8)
@@ -823,8 +770,10 @@ async def _seed(pool: asyncpg.Pool) -> None:
                     " VALUES ($1,'Test Shop',$2,'Test Ltd','starter','active',2)",
                     st, st_email,
                 )
+                # Create tenant schema and insert widget_configs
+                await create_tenant_schema(conn, st)
                 await conn.execute(
-                    "INSERT INTO widget_configs (tenant_id,name,notification_email)"
+                    f'INSERT INTO "t_{st}".widget_configs (tenant_id,name,notification_email)'
                     " VALUES ($1,'Test Shop',$2)",
                     st, st_email,
                 )
@@ -840,6 +789,12 @@ async def _seed(pool: asyncpg.Pool) -> None:
                     " (id,tenant_id,name,email,password_hash,role)"
                     " VALUES ($1,$2,'Shop Owner',$3,$4,'owner')",
                     secrets.token_hex(8), st, st_email, hash_password("Test123!"),
+                )
+                
+                # tenant_stats row
+                await conn.execute(
+                    "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
+                    " ON CONFLICT (tenant_id) DO NOTHING", st
                 )
                 logger.info("  ✅ test@shop.com / Test123!  (Starter plan)")
             

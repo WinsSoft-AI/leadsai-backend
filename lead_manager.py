@@ -167,7 +167,7 @@ class LeadManager:
         </div>
         """
         # Check platform_settings for custom queries email
-        from db_init import get_pool
+        from db import get_pool
         admin_email = os.getenv("SMTP_USER", "sales@winssoft.com")
         try:
             pool = await get_pool()

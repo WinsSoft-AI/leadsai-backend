@@ -1136,10 +1136,27 @@ async def cv_search(
     tenant=Depends(verify_widget_jwt),
 ):
     img_bytes = await file.read()
+    try:
+        mime_type = validate_image(img_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+        
+    ext = Path(file.filename or "image.jpg").suffix or ".jpg"
+    key = f"uploads/cv_search/{tenant['id']}_{secrets.token_hex(8)}{ext}"
+    
+    actual_key = await app.state.s3.upload(
+        key=key,
+        content=img_bytes,
+        content_type=mime_type,
+        cache_control="public, max-age=86400",
+        tagging="lifecycle=1day"
+    )
+    image_url = app.state.s3.resolve_url(actual_key)
+
     matches   = await app.state.ai.cv_search(
         image_bytes=img_bytes, tenant_id=tenant["id"], top_k=3
     )
-    return {"matches": matches, "session_id": session_id}
+    return {"matches": matches, "session_id": session_id, "image_url": image_url}
 
 @app.post("/v1/behavior", tags=["Widget"])
 async def track_behavior(event: BehaviorEvent, tenant=Depends(verify_widget_jwt)):
@@ -2107,7 +2124,7 @@ async def kb_upload_product_image(
         raise HTTPException(status_code=400, detail=str(e))
 
     ext = Path(file.filename or "image.jpg").suffix or ".jpg"
-    key = f"tenants/{tid}/products/{secrets.token_hex(8)}{ext}"
+    key = f"image_data/products/{tid}_{secrets.token_hex(8)}{ext}"
 
     actual_key = await app.state.s3.upload(
         key=key,
@@ -2656,10 +2673,10 @@ async def upload_tenant_logo(
         raise HTTPException(status_code=400, detail=str(e))
 
     ext = Path(file.filename or "logo.png").suffix or ".png"
-    key = f"tenants/{current['tenant_id']}/logo{ext}"
+    key = f"image_data/logo/{current['tenant_id']}{ext}"
 
     # Delete existing logo with different prefix to keep it clean (cascade)
-    await app.state.s3.delete_prefix(f"tenants/{current['tenant_id']}/logo.")
+    await app.state.s3.delete_prefix(f"image_data/logo/{current['tenant_id']}.")
 
     actual_key = await app.state.s3.upload(
         key=key,
@@ -4095,6 +4112,8 @@ async def sa_delete_client(client_id: str, current: dict = Depends(require_super
         await conn.execute("DELETE FROM tenants WHERE id=$1", client_id)
         await _audit(conn, current, "delete_tenant", "tenant", client_id, {}, tenant_id=client_id)
     await app.state.s3.delete_prefix(f"tenants/{client_id}/")
+    await app.state.s3.delete_prefix(f"image_data/logo/{client_id}.")
+    await app.state.s3.delete_prefix(f"image_data/products/{client_id}_")
     return {"status": "deleted"}
 
 # ── Superadmin: Change Tenant Email (OTP-verified) ────────────────────────
@@ -4406,7 +4425,7 @@ async def sa_kb_upload_product_image(
         raise HTTPException(status_code=400, detail=str(e))
 
     ext = Path(file.filename or "image.jpg").suffix or ".jpg"
-    key = f"tenants/{client_id}/products/{secrets.token_hex(8)}{ext}"
+    key = f"image_data/products/{client_id}_{secrets.token_hex(8)}{ext}"
 
     actual_key = await app.state.s3.upload(
         key=key,

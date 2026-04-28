@@ -50,15 +50,12 @@ USER DASHBOARD  (JWT — owner|member)
   PUT  /v1/widget-config
   POST /v1/verify-domain
   GET  /v1/widget-embed
-  GET  /v1/domains
-  POST /v1/domains
-  DELETE /v1/domains/{domain_id}
   GET  /v1/usage
   GET  /v1/subscription
   GET  /v1/payment/history
   POST /v1/payment/create-order
   POST /v1/payment/verify
-  GET  /v1/settings
+  GET  /v1/settings                       ← includes read-only authorized_domains
   PUT  /v1/settings
   GET  /v1/tickets
   POST /v1/tickets
@@ -75,8 +72,10 @@ ADMIN  (JWT — admin|superadmin)
   GET  /admin/clients/{client_id}/domains
   GET  /admin/clients/{client_id}/usage
   GET  /admin/clients/{client_id}/tickets
-  POST /admin/clients/{client_id}/add-domain
+  POST /admin/clients/{client_id}/request-domain-otp
+  POST /admin/clients/{client_id}/add-domain    ← requires tenant OTP
   DELETE /admin/clients/{client_id}/domains/{domain_id}
+  POST /admin/clients/{client_id}/unlock-password-reset
   POST /admin/clients/{client_id}/extend-plan
   POST /admin/clients/{client_id}/change-plan
   POST /admin/clients/{client_id}/suspend
@@ -305,11 +304,26 @@ async def _meter_tokens(tenant_id: str, input_tokens: int, output_tokens: int):
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Dashboard origins that bypass domain validation (for test-chat, etc.)
-_DASHBOARD_ORIGINS = [
+_DASHBOARD_ORIGINS_ENV = [
     o.strip() for o in
     os.getenv("DASHBOARD_ORIGINS", "http://localhost:5173,http://localhost:3000,http://localhost:8000").split(",")
     if o.strip()
 ]
+
+async def _get_dashboard_origins() -> list[str]:
+    """Merge env-based + DB-based dashboard origins (from platform_settings)."""
+    origins = list(_DASHBOARD_ORIGINS_ENV)
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            val = await conn.fetchval(
+                "SELECT value FROM platform_settings WHERE key='dashboard_origins'"
+            )
+            if val:
+                origins.extend(o.strip() for o in val.split(",") if o.strip())
+    except Exception:
+        pass
+    return origins
 
 def _extract_domain(request: Request) -> str:
     """
@@ -367,10 +381,72 @@ def _domain_matches(registered_domain: str, request_origin: str) -> bool:
         return False
     return reg_sld == req_sld
 
+
+async def _check_tenant_cors(request: Request, tenant_id: str) -> None:
+    """
+    Shared CORS enforcement for widget endpoints.
+    Checks request origin against tenant_domains table + dashboard origins.
+    Raises HTTPException(403) on mismatch.
+    """
+    request_origin = _extract_domain(request)
+    if not request_origin or request_origin in ("localhost", "127.0.0.1"):
+        return  # skip for local dev / direct curl
+
+    # Check against dynamic dashboard origins
+    dashboard_origins = await _get_dashboard_origins()
+    if any(request_origin in o for o in dashboard_origins):
+        return  # Dashboard origin — always allowed
+
+    # Fetch all authorized domains from tenant_domains table
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT domain FROM tenant_domains WHERE tenant_id=$1", tenant_id
+        )
+    authorized = [r["domain"] for r in rows]
+
+    # Also fall back to tenants.domain for backward compat (old tenants without seeded rows)
+    if not authorized:
+        async with pool.acquire() as conn:
+            legacy = await conn.fetchval(
+                "SELECT domain FROM tenants WHERE id=$1", tenant_id
+            )
+            if legacy:
+                legacy = legacy.split("://")[-1].split("/")[0].split(":")[0].lower()
+                authorized = [legacy]
+
+    if not authorized:
+        return  # No domains configured — allow (new tenant)
+
+    # Check if request origin matches ANY authorized domain
+    if any(_domain_matches(d, request_origin) for d in authorized):
+        return  # Authorized
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"CORS Policy: Origin '{request_origin}' is not authorized for this widget."
+    )
+
 import jwt as pyjwt
 from datetime import datetime, timedelta, timezone
+import time
+from collections import defaultdict
+
+# Simple In-Memory Rate Limiter (60 requests per minute per IP)
+_widget_ip_rates = defaultdict(list)
+_WIDGET_RATE_LIMIT = 60
+_WIDGET_RATE_WINDOW = 60
 
 async def verify_widget_jwt(request: Request) -> Dict:
+    # 0. Global Rate Limiting for Widget APIs
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    
+    # Clean up old timestamps and append new
+    _widget_ip_rates[client_ip] = [t for t in _widget_ip_rates[client_ip] if now - t < _WIDGET_RATE_WINDOW]
+    if len(_widget_ip_rates[client_ip]) >= _WIDGET_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too Many Requests")
+    _widget_ip_rates[client_ip].append(now)
     """
     JWT-based authorization for widget endpoints.
     Accepts a Bearer token issued by /v1/widget/token to verify the tenant.
@@ -423,20 +499,9 @@ async def verify_widget_jwt(request: Request) -> Dict:
     except pyjwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # Domain check on every request (SLD match)
+    # Domain check on every request (multi-domain CORS via tenant_domains table)
     tenant_config = await _get_tenant_config(tenant_id)
-
-    request_origin = _extract_domain(request)
-    tenant_domain = (tenant_config.get("domain") or "").lower()
-    if tenant_domain:
-        tenant_domain = tenant_domain.split("://")[-1].split("/")[0].split(":")[0]
-
-    if request_origin and request_origin != "localhost" and request_origin != "127.0.0.1":
-        if tenant_domain and not _domain_matches(tenant_domain, request_origin):
-            is_dashboard_origin = any(request_origin in o for o in _DASHBOARD_ORIGINS)
-            if not is_dashboard_origin:
-                raise HTTPException(status_code=403, detail=f"CORS Policy: Origin '{request_origin}' is not authorized for this widget.")
-
+    await _check_tenant_cors(request, tenant_id)
     return tenant_config
 
 async def _get_tenant_config(tenant_id: str) -> Dict:
@@ -559,6 +624,14 @@ class WidgetTokenReq(BaseModel):
 
 @app.post("/v1/widget/token", tags=["Widget"])
 async def get_widget_token(req: WidgetTokenReq, request: Request, bg_tasks: BackgroundTasks):
+    # 0. Global Rate Limiting
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    _widget_ip_rates[client_ip] = [t for t in _widget_ip_rates[client_ip] if now - t < _WIDGET_RATE_WINDOW]
+    if len(_widget_ip_rates[client_ip]) >= _WIDGET_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too Many Requests")
+    _widget_ip_rates[client_ip].append(now)
+
     """Public endpoint: exchanges a company slug for a short-lived Widget JWT.
     Uses per-tenant widget_secret for signing. Auto-rotates secret in background."""
     pool = await get_pool()
@@ -573,22 +646,17 @@ async def get_widget_token(req: WidgetTokenReq, request: Request, bg_tasks: Back
 
         tenant_id = row["id"]
 
-        # Enforce CORS Domain Policy (SLD match)
-        request_origin = _extract_domain(request)
-        tenant_domain = (row["domain"] or "").lower()
-        if tenant_domain:
-            tenant_domain = tenant_domain.split("://")[-1].split("/")[0].split(":")[0]
-
-        if request_origin and request_origin != "localhost" and request_origin != "127.0.0.1":
-            if tenant_domain and not _domain_matches(tenant_domain, request_origin):
-                is_dashboard_origin = any(request_origin in o for o in _DASHBOARD_ORIGINS)
-                if not is_dashboard_origin:
-                    # Bypass detected — send alert in background, don't slow down the 403
-                    bg_tasks.add_task(
-                        _alert_bypass_attempt,
-                        req.company_slug, request_origin, tenant_id, tenant_domain
-                    )
-                    raise HTTPException(status_code=403, detail=f"CORS Policy: Origin '{request_origin}' is not authorized for this widget.")
+        # Enforce CORS Domain Policy (multi-domain via tenant_domains table)
+        try:
+            await _check_tenant_cors(request, tenant_id)
+        except HTTPException:
+            # Bypass detected — send alert in background, then re-raise
+            request_origin = _extract_domain(request)
+            bg_tasks.add_task(
+                _alert_bypass_attempt,
+                req.company_slug, request_origin, tenant_id, row.get("domain", "")
+            )
+            raise
 
         # Use tenant's own widget_secret for signing
         tenant_secret = row["widget_secret"]
@@ -618,6 +686,14 @@ async def get_widget_token(req: WidgetTokenReq, request: Request, bg_tasks: Back
 
 @app.get("/v1/widget/config", tags=["Widget"])
 async def get_widget_config(request: Request, slug: str = None):
+    # 0. Global Rate Limiting
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    _widget_ip_rates[client_ip] = [t for t in _widget_ip_rates[client_ip] if now - t < _WIDGET_RATE_WINDOW]
+    if len(_widget_ip_rates[client_ip]) >= _WIDGET_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too Many Requests")
+    _widget_ip_rates[client_ip].append(now)
+
     tenant_id = None
     if slug:
         pool = await get_pool()
@@ -748,96 +824,6 @@ async def list_plans():
             for row in rows
         }
 
-# ═════════════════════════════════════════════════════════════════════════════
-# WIDGET  (JWT Auth via slug)
-# ═════════════════════════════════════════════════════════════════════════════
-
-class WidgetTokenReq(BaseModel):
-    company_slug: str
-
-@app.post("/v1/widget/token", tags=["Widget"])
-async def get_widget_token(req: WidgetTokenReq, request: Request):
-    """Public endpoint: exchanges a company slug for a short-lived Widget JWT."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, status, domain FROM tenants WHERE widget_slug=$1 AND status='active'",
-            req.company_slug
-        )
-        if not row:
-            raise HTTPException(status_code=403, detail="Account activation issue. Please contact support.")
-
-        # Enforce CORS Domain Policy
-        request_origin = _extract_domain(request)
-        tenant_domain = (row["domain"] or "").lower()
-        if tenant_domain:
-            tenant_domain = tenant_domain.split("://")[-1].split("/")[0].split(":")[0]
-
-        # Ignore if missing request origin (e.g. direct curl), or if testing from dashboard
-        if request_origin and request_origin != "localhost" and request_origin != "127.0.0.1":
-            if tenant_domain and not _domain_matches(tenant_domain, request_origin):
-                is_dashboard_origin = any(request_origin in o for o in _DASHBOARD_ORIGINS)
-                if not is_dashboard_origin:
-                    raise HTTPException(status_code=403, detail=f"CORS Policy: Origin '{request_origin}' is not authorized for this widget.")
-        
-        secret = os.getenv("WIDGET_JWT_SECRET")
-        if not secret:
-            raise HTTPException(status_code=500, detail="WIDGET_JWT_SECRET not configured")
-            
-        expires_min = int(os.getenv("WIDGET_JWT_EXPIRE_MINUTES", "60"))
-        
-        payload = {
-            "tid": row["id"],
-            "type": "widget",
-            "exp": datetime.utcnow() + timedelta(minutes=expires_min),
-            "iat": datetime.utcnow()
-        }
-        token = pyjwt.encode(payload, secret, algorithm="HS256")
-        return {"access_token": token, "type": "bearer", "expires_in": expires_min * 60}
-
-@app.get("/v1/widget/config", tags=["Widget"])
-async def get_widget_config(request: Request, slug: str = None):
-    tenant_id = None
-    if slug:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            tenant_id = await conn.fetchval(
-                "SELECT id FROM tenants WHERE widget_slug=$1 AND status='active'", slug
-            )
-            if not tenant_id:
-                raise HTTPException(status_code=403, detail="Company not found or inactive")
-    else:
-        # Dashboard preview — extract tenant_id from JWT
-        try:
-            tenant = await verify_widget_jwt(request)
-            tenant_id = tenant.get("tenant_id") or tenant.get("id")
-        except Exception:
-            raise HTTPException(status_code=401, detail="Missing slug or valid token")
-
-    tenant = await _get_tenant_config(tenant_id)
-
-    return {
-        "name":               tenant.get("name"),
-        "greeting":           tenant.get("greeting"),
-        "primary_color":      tenant.get("primary_color"),
-        "accent_color":       tenant.get("accent_color"),
-        "secondary_color":    tenant.get("secondary_color"),
-        "text_color":         tenant.get("text_color"),
-        "bg_image_url":       app.state.s3.resolve_url(tenant.get("bg_image_url")),
-        "position":           tenant.get("position"),
-        "proactive_enabled":  tenant.get("proactive_enabled"),
-        "tts_enabled":        tenant.get("tts_enabled"),
-        "stt_enabled":        tenant.get("stt_enabled"),
-        "cv_search_enabled":  tenant.get("cv_search_enabled"),
-        "languages":          tenant.get("languages"),
-        "logo_url":           app.state.s3.resolve_url(tenant.get("logo_url")),
-        "bot_text_color":     tenant.get("bot_text_color"),
-        "user_text_color":    tenant.get("user_text_color"),
-        "business_name":      tenant.get("widget_name") or tenant.get("name"),
-        "pii_after_messages": tenant.get("pii_after_messages"),
-        "proactive_delay_s":  tenant.get("proactive_delay_s"),
-        "proactive_message":  tenant.get("proactive_message"),
-    }
 
 # ── Session metadata helpers ─────────────────────────────────────────────────
 import re as _re
@@ -2416,14 +2402,33 @@ async def get_widget_embed(request: Request, current: dict = Depends(get_current
     if not cdn_base:
         cdn_base = str(request.base_url).rstrip("/") + "/widget"
 
-    domain_snippet = (
-        f"<!-- Leads AI Widget -->\n"
-        f"<script\n"
-        f'  src="{cdn_base}/leadsai.js"\n'
-        f'  data-company="{cfg["widget_slug"]}"\n'
-        f"  defer\n"
-        f"></script>"
-    )
+    api_base_url = str(request.base_url).rstrip("/")
+    fallback_base = api_base_url + "/widget"
+    
+    if cdn_base and cdn_base != fallback_base:
+        # Use CDN with a robust fallback script if the CDN fails
+        domain_snippet = (
+            f"<!-- Leads AI Widget -->\n"
+            f"<script\n"
+            f'  src="{cdn_base}/leadsai.js"\n'
+            f'  data-company="{cfg["widget_slug"]}"\n'
+            f'  data-api-base="{api_base_url}"\n'
+            f'  id="leadsai-embed-script"\n'
+            f"  defer\n"
+            f"  onerror=\"this.onerror=null;var s=document.createElement('script');s.src='{fallback_base}/leadsai.js';s.setAttribute('data-company','{cfg['widget_slug']}');s.setAttribute('data-api-base','{api_base_url}');s.defer=true;document.body.appendChild(s);\"\n"
+            f"></script>"
+        )
+    else:
+        domain_snippet = (
+            f"<!-- Leads AI Widget -->\n"
+            f"<script\n"
+            f'  src="{fallback_base}/leadsai.js"\n'
+            f'  data-company="{cfg["widget_slug"]}"\n'
+            f'  data-api-base="{api_base_url}"\n'
+            f'  id="leadsai-embed-script"\n'
+            f"  defer\n"
+            f"></script>"
+        )
     snippets = [{
         "domain":  "Global Snippet",
         "label":   "Universal Embed snippet",
@@ -2582,6 +2587,19 @@ async def get_settings(current: dict = Depends(get_current_user)):
     if u.get("created_at"):
         u_dict["created_at"] = str(u.get("created_at"))
     
+    # Fetch authorized domains (read-only for tenant)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        domain_rows = await conn.fetch(
+            "SELECT domain, verified, created_at FROM tenant_domains"
+            " WHERE tenant_id=$1 ORDER BY created_at ASC",
+            current["tenant_id"],
+        )
+    authorized_domains = [
+        {"domain": r["domain"], "verified": r["verified"], "added_at": str(r["created_at"])}
+        for r in domain_rows
+    ]
+
     return {
         "tenant": t_dict,
         "user":   u_dict,
@@ -2590,6 +2608,7 @@ async def get_settings(current: dict = Depends(get_current_user)):
             "period_end": sub["current_period_end"].isoformat() if sub and sub["current_period_end"] else None,
             "status":     sub["status"] if sub else None,
         } if sub else None,
+        "authorized_domains": authorized_domains,
     }
 
 @app.put("/v1/settings", tags=["Dashboard"])
@@ -3618,6 +3637,177 @@ async def admin_activate(client_id: str, current: dict = Depends(require_admin))
         )
         await _audit(conn, current, "activate_tenant", "tenant", client_id, {}, tenant_id=client_id)
     return {"status": "active"}
+
+# ── Admin domain management ────────────────────────────────────────────────────
+
+class _DomainOTPReq(BaseModel):
+    domain: str
+
+class _DomainAddReq(BaseModel):
+    domain: str
+    otp:    str
+
+@app.get("/admin/clients/{client_id}/domains", tags=["Admin"])
+async def admin_list_domains(client_id: str, current: dict = Depends(require_admin)):
+    """List all authorized domains for a tenant."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, domain, added_by, verified, created_at"
+            " FROM tenant_domains WHERE tenant_id=$1 ORDER BY created_at ASC",
+            client_id,
+        )
+    return {"domains": [dict(r) for r in rows]}
+
+
+@app.post("/admin/clients/{client_id}/request-domain-otp", tags=["Admin"])
+async def admin_request_domain_otp(
+    client_id: str,
+    req: _DomainOTPReq,
+    request: Request,
+    current: dict = Depends(require_admin),
+):
+    """Send OTP to tenant's registered email to authorize adding a new domain."""
+    import hashlib as _hashlib
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow(
+            "SELECT email, name FROM tenants WHERE id=$1", client_id
+        )
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        # Check if domain already exists
+        existing = await conn.fetchval(
+            "SELECT id FROM tenant_domains WHERE tenant_id=$1 AND domain=$2",
+            client_id, req.domain.lower().strip(),
+        )
+        if existing:
+            raise HTTPException(status_code=409, detail="Domain already authorized")
+
+        # Invalidate any previous domain OTPs for this tenant
+        await conn.execute(
+            "UPDATE otps SET used=TRUE WHERE email=$1 AND purpose='domain_add' AND used=FALSE",
+            tenant["email"],
+        )
+
+        otp_raw = "".join(str(secrets.randbelow(10)) for _ in range(6))
+        otp_hash = _hashlib.sha256(otp_raw.encode()).hexdigest()
+
+        import json
+        await conn.execute(
+            "INSERT INTO otps (id, email, otp_hash, purpose, payload, expires_at)"
+            " VALUES ($1,$2,$3,'domain_add',$4, NOW() + INTERVAL '10 minutes')",
+            secrets.token_hex(8), tenant["email"], otp_hash,
+            json.dumps({"domain": req.domain.lower().strip(), "tenant_id": client_id}),
+        )
+
+    # Send OTP to tenant email
+    await request.app.state.leads.send_otp_email(
+        tenant["email"], otp_raw, f"Domain Authorization — {req.domain}"
+    )
+    return {"message": f"OTP sent to tenant email ({tenant['email']})"}
+
+
+@app.post("/admin/clients/{client_id}/add-domain", tags=["Admin"])
+async def admin_add_domain(
+    client_id: str,
+    req: _DomainAddReq,
+    current: dict = Depends(require_admin),
+):
+    """Add an authorized domain to a tenant. Requires OTP from tenant."""
+    import hashlib as _hashlib
+
+    otp_hash = _hashlib.sha256(req.otp.encode()).hexdigest()
+    domain = req.domain.lower().strip()
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Verify OTP
+        otp_row = await conn.fetchrow(
+            "SELECT id, payload FROM otps"
+            " WHERE otp_hash=$1 AND purpose='domain_add' AND used=FALSE AND expires_at > NOW()"
+            " ORDER BY created_at DESC LIMIT 1",
+            otp_hash,
+        )
+        if not otp_row:
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+        # Verify payload matches
+        payload = otp_row["payload"] if isinstance(otp_row["payload"], dict) else __import__("json").loads(otp_row["payload"])
+        if payload.get("tenant_id") != client_id or payload.get("domain") != domain:
+            raise HTTPException(status_code=400, detail="OTP does not match this domain/tenant")
+
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO tenant_domains (id, tenant_id, domain, added_by, verified)"
+                " VALUES ($1, $2, $3, $4, TRUE)"
+                " ON CONFLICT (tenant_id, domain) DO NOTHING",
+                secrets.token_hex(8), client_id, domain, current["id"],
+            )
+            await conn.execute(
+                "UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"]
+            )
+            await _audit(conn, current, "add_domain", "tenant", client_id,
+                         {"domain": domain}, tenant_id=client_id)
+
+    return {"status": "added", "domain": domain}
+
+
+@app.delete("/admin/clients/{client_id}/domains/{domain_id}", tags=["Admin"])
+async def admin_delete_domain(
+    client_id: str,
+    domain_id: str,
+    current: dict = Depends(require_admin),
+):
+    """Remove an authorized domain from a tenant."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT domain FROM tenant_domains WHERE id=$1 AND tenant_id=$2",
+            domain_id, client_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Domain not found")
+
+        await conn.execute("DELETE FROM tenant_domains WHERE id=$1", domain_id)
+        await _audit(conn, current, "remove_domain", "tenant", client_id,
+                     {"domain": row["domain"]}, tenant_id=client_id)
+
+    return {"status": "removed", "domain": row["domain"]}
+
+
+# ── Admin unlock password reset ────────────────────────────────────────────────
+
+@app.post("/admin/clients/{client_id}/unlock-password-reset", tags=["Admin"])
+async def admin_unlock_password_reset(
+    client_id: str,
+    current: dict = Depends(require_admin),
+):
+    """Clear forgot-password lockout for a tenant's owner. Requires admin JWT."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Get tenant owner email
+        owner = await conn.fetchrow(
+            "SELECT email FROM user_auth WHERE tenant_id=$1 AND role='owner' LIMIT 1",
+            client_id,
+        )
+        if not owner:
+            raise HTTPException(status_code=404, detail="Tenant owner not found")
+
+        # Delete today's forgot-password attempts for this email
+        await conn.execute(
+            "DELETE FROM login_attempts"
+            " WHERE email=$1 AND purpose='forgot_password'"
+            "   AND created_at >= CURRENT_DATE",
+            owner["email"],
+        )
+        await _audit(conn, current, "unlock_password_reset", "tenant", client_id,
+                     {"email": owner["email"]}, tenant_id=client_id)
+
+    return {"status": "unlocked", "email": owner["email"]}
+
 
 # ── Admin tickets ──────────────────────────────────────────────────────────────
 @app.get("/admin/tickets", tags=["Admin"])

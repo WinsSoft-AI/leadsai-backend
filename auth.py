@@ -180,6 +180,7 @@ require_superadmin = require_role("superadmin")
 class LoginReq(BaseModel):
     email:    EmailStr
     password: str
+    otp:      Optional[str] = None  # Required after 3 failed attempts
 
 
 class RegisterOTPReq(BaseModel):
@@ -228,15 +229,72 @@ class MeUpdate(BaseModel):
 # ═════════════════════════════════════════════════════════════════════════════
 
 @router.post("/login")
-async def login(req: LoginReq):
+async def login(req: LoginReq, request: Request):
     """
     Universal login — checks user_auth first, then admin_users.
+    After 3 failed attempts in 30 minutes, OTP is required.
     Returns JWT access_token + user info.
     """
+    _LOGIN_FAIL_THRESHOLD = 3
+    _LOGIN_FAIL_WINDOW_MIN = 30
+
+    client_ip = request.client.host if request.client else "unknown"
     pool = await get_pool()
     async with pool.acquire() as conn:
 
-        # Try tenant dashboard user
+        # ── Step 0: Check failed attempt count ─────────────────────────────
+        fail_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM login_attempts"
+            " WHERE email=$1 AND purpose='login' AND success=FALSE"
+            "   AND created_at > NOW() - INTERVAL '30 minutes'",
+            req.email,
+        ) or 0
+
+        otp_required = fail_count >= _LOGIN_FAIL_THRESHOLD
+
+        if otp_required:
+            if not req.otp:
+                # Send OTP and tell client to retry with OTP
+                otp_raw = "".join(str(secrets.randbelow(10)) for _ in range(6))
+                otp_hash = hashlib.sha256(otp_raw.encode()).hexdigest()
+
+                # Invalidate any previous login OTPs
+                await conn.execute(
+                    "UPDATE otps SET used=TRUE WHERE email=$1 AND purpose='login_verify' AND used=FALSE",
+                    req.email,
+                )
+                await conn.execute(
+                    "INSERT INTO otps (id, email, otp_hash, purpose, expires_at)"
+                    " VALUES ($1,$2,$3,'login_verify', NOW() + INTERVAL '5 minutes')",
+                    secrets.token_hex(8), req.email, otp_hash,
+                )
+                try:
+                    await request.app.state.leads.send_otp_email(req.email, otp_raw, "Login Verification")
+                except Exception as e:
+                    logger.error(f"Login OTP email failed for {req.email}: {e}")
+
+                raise HTTPException(
+                    status_code=403,
+                    detail="Too many failed attempts. OTP sent to your email.",
+                    headers={"X-Requires-OTP": "true"},
+                )
+
+            # Verify OTP
+            otp_hash = hashlib.sha256(req.otp.encode()).hexdigest()
+            otp_row = await conn.fetchrow(
+                "SELECT id FROM otps"
+                " WHERE email=$1 AND otp_hash=$2 AND purpose='login_verify'"
+                "   AND used=FALSE AND expires_at > NOW()"
+                " ORDER BY created_at DESC LIMIT 1",
+                req.email, otp_hash,
+            )
+            if not otp_row:
+                raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+            # Mark OTP as used
+            await conn.execute("UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"])
+
+        # ── Step 1: Try tenant dashboard user ──────────────────────────────
         row = await conn.fetchrow(
             "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit, t.logo_url, t.company,"
             " t.status AS tenant_status, t.suspension_reason, t.domain_verified"
@@ -246,6 +304,17 @@ async def login(req: LoginReq):
             req.email,
         )
         if row and verify_password(req.password, row["password_hash"]):
+            # Success — clear failed attempts
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                req.email,
+            )
+            await conn.execute(
+                "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+                " VALUES ($1, $2, TRUE, 'login')",
+                req.email, client_ip,
+            )
+
             payload = {
                 "sub":          row["id"],
                 "role":         row["role"],
@@ -274,12 +343,23 @@ async def login(req: LoginReq):
             session_hrs = await _get_session_hours()
             return {"access_token": _access_token(payload, session_hrs), "user": user_out}
 
-        # Try admin / superadmin
+        # ── Step 2: Try admin / superadmin ─────────────────────────────────
         row = await conn.fetchrow(
             "SELECT * FROM admin_users WHERE email=$1 AND status='active'",
             req.email,
         )
         if row and verify_password(req.password, row["password_hash"]):
+            # Success — clear failed attempts
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                req.email,
+            )
+            await conn.execute(
+                "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+                " VALUES ($1, $2, TRUE, 'login')",
+                req.email, client_ip,
+            )
+
             payload = {
                 "sub":          row["id"],
                 "role":         row["role"],
@@ -298,6 +378,13 @@ async def login(req: LoginReq):
             )
             session_hrs = await _get_session_hours()
             return {"access_token": _access_token(payload, session_hrs), "user": user_out}
+
+        # ── Step 3: Failed login — record attempt ──────────────────────────
+        await conn.execute(
+            "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+            " VALUES ($1, $2, FALSE, 'login')",
+            req.email, client_ip,
+        )
 
     raise HTTPException(status_code=401, detail="Invalid email or password")
 
@@ -523,6 +610,18 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
                 " ON CONFLICT (tenant_id) DO NOTHING", tid
             )
 
+            # Seed signup domain into tenant_domains (CORS whitelist)
+            if website:
+                signup_domain = website.split("://")[-1].split("/")[0].split(":")[0].lower()
+                signup_domain = signup_domain.replace("www.", "")
+                if signup_domain:
+                    await conn.execute(
+                        "INSERT INTO tenant_domains (id, tenant_id, domain, added_by, verified)"
+                        " VALUES ($1, $2, $3, 'system', $4)"
+                        " ON CONFLICT (tenant_id, domain) DO NOTHING",
+                        secrets.token_hex(8), tid, signup_domain, domain_verified,
+                    )
+
             uid = secrets.token_hex(8)
             await conn.execute(
                 "INSERT INTO user_auth"
@@ -568,11 +667,28 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
 @router.post("/forgot-password")
 async def forgot_password(req: ForgotPwdReq, request: Request):
     """
-    Generate a password-reset token and (in production) send an email.
-    Returns the token in the response for development — strip this in prod.
+    Generate a password-reset OTP and send it via email.
+    Locked after 2 attempts per day — admin must unlock via ticket.
     """
+    _FORGOT_PWD_DAILY_LIMIT = 2
+    client_ip = request.client.host if request.client else "unknown"
+
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # ── Lockout check: count today's forgot-password attempts ──────────
+        today_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM login_attempts"
+            " WHERE email=$1 AND purpose='forgot_password'"
+            "   AND created_at >= CURRENT_DATE",
+            req.email,
+        ) or 0
+
+        if today_count >= _FORGOT_PWD_DAILY_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Password reset locked for today. Please raise a support ticket from your company dashboard.",
+            )
+
         # Check user_auth first, then admin_users
         user_row = await conn.fetchrow(
             "SELECT id,'user' AS utype FROM user_auth WHERE email=$1 AND status='active'",
@@ -584,8 +700,20 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
                 req.email,
             )
         if not user_row:
-            # Don't reveal whether the email exists
+            # Don't reveal whether the email exists — but still record the attempt
+            await conn.execute(
+                "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+                " VALUES ($1, $2, FALSE, 'forgot_password')",
+                req.email, client_ip,
+            )
             return {"message": "If that email is registered, a reset link has been sent."}
+
+        # Record this forgot-password attempt
+        await conn.execute(
+            "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+            " VALUES ($1, $2, FALSE, 'forgot_password')",
+            req.email, client_ip,
+        )
 
         # Invalidate any existing unused tokens for this user
         await conn.execute(
@@ -597,7 +725,7 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
         # Generate 6-digit numeric OTP
         otp = "".join(secrets.choice("0123456789") for _ in range(6))
         token_hash = hashlib.sha256(otp.encode()).hexdigest()
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15) # OTPs expire faster (15 mins)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
 
         await conn.execute(
             "INSERT INTO password_reset_tokens"
@@ -612,8 +740,6 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
             token_hash,
             expires_at,
         )
-
-        await conn.execute(...)
 
     # Send real email with OTP
     await request.app.state.leads.send_otp_email(req.email, otp, "Password Reset")

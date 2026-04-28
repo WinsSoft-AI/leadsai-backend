@@ -5,14 +5,17 @@
     return;
   }
 
-  // 1. Determine API base from script src
-  let apiBase = "https://outhouse-cognitive-magical.ngrok-free.dev"; // default production
-  try {
-    if (scriptTag.src) {
-      const url = new URL(scriptTag.src);
-      apiBase = url.origin;
-    }
-  } catch (_) { }
+  // 1. Determine API base (from data-api-base attribute or fallback to script src origin)
+  let apiBase = scriptTag.getAttribute("data-api-base");
+  if (!apiBase) {
+    apiBase = "https://outhouse-cognitive-magical.ngrok-free.dev"; // fallback default
+    try {
+      if (scriptTag.src) {
+        const url = new URL(scriptTag.src);
+        apiBase = url.origin;
+      }
+    } catch (_) { }
+  }
 
   const API_URL = apiBase;
 

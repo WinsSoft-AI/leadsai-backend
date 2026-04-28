@@ -353,6 +353,31 @@ _PUBLIC_TABLES: list[str] = [
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
+
+    # ── tenant_domains (multi-domain CORS whitelist per tenant) ────────────────
+    """
+    CREATE TABLE IF NOT EXISTS tenant_domains (
+        id         TEXT        PRIMARY KEY,
+        tenant_id  TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        domain     TEXT        NOT NULL,
+        added_by   TEXT        NOT NULL,
+        verified   BOOLEAN     NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(tenant_id, domain)
+    )
+    """,
+
+    # ── login_attempts (brute-force tracking for login + forgot-password) ──────
+    """
+    CREATE TABLE IF NOT EXISTS login_attempts (
+        id         BIGSERIAL   PRIMARY KEY,
+        email      TEXT        NOT NULL,
+        ip_address TEXT,
+        success    BOOLEAN     NOT NULL DEFAULT FALSE,
+        purpose    TEXT        NOT NULL DEFAULT 'login',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
 ]
 
 
@@ -532,6 +557,10 @@ _PUBLIC_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_pwd_reset_hash        ON password_reset_tokens(token_hash)",
     "CREATE INDEX IF NOT EXISTS idx_otp_email             ON otps(email)",
     "CREATE INDEX IF NOT EXISTS idx_otp_purpose           ON otps(email, purpose)",
+    "CREATE INDEX IF NOT EXISTS idx_tenant_domains_tid    ON tenant_domains(tenant_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_domains_unique ON tenant_domains(tenant_id, domain)",
+    "CREATE INDEX IF NOT EXISTS idx_login_attempts_email  ON login_attempts(email, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_login_attempts_purpose ON login_attempts(email, purpose, created_at DESC)",
 ]
 
 # Indexes for tenant schema tables — applied to both the template and each tenant schema
@@ -668,6 +697,7 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                 ("product_import_template", default_template),
                 ("generic_email_domains",   "gmail.com,yahoo.com,yahoo.co.in,outlook.com,hotmail.com,aol.com,icloud.com,mail.com,protonmail.com,zoho.com,yandex.com,gmx.com,live.com,rediffmail.com"),
                 ("queries_email",           ""),
+                ("dashboard_origins",       ""),
             ]
             await conn.executemany(
                 "INSERT INTO platform_settings (key, value) VALUES ($1, $2)"

@@ -31,10 +31,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncpg
+import base64
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
+
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
+from cryptography.hazmat.primitives import serialization, hashes
 
 from db import (
     get_pool,
@@ -55,6 +60,43 @@ except ImportError:
 logger   = logging.getLogger(__name__)
 router   = APIRouter(prefix="/auth", tags=["Auth"])
 _bearer  = HTTPBearer(auto_error=False)
+
+# ── RSA keypair for password encryption in transit ─────────────────────────────
+_RSA_PRIVATE_KEY = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
+_RSA_PUBLIC_KEY = _RSA_PRIVATE_KEY.public_key()
+_RSA_PUBLIC_PEM = _RSA_PUBLIC_KEY.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+).decode()
+
+logger.info("RSA keypair generated for password encryption in transit")
+
+
+def decrypt_password(encrypted_b64: str) -> str:
+    """Decrypt an RSA-OAEP encrypted password sent from the frontend."""
+    try:
+        ciphertext = base64.b64decode(encrypted_b64)
+        plaintext = _RSA_PRIVATE_KEY.decrypt(
+            ciphertext,
+            asym_padding.OAEP(
+                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return plaintext.decode("utf-8")
+    except Exception as e:
+        logger.error(f"Password decryption failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid encrypted password")
+
+
+@router.get("/public-key")
+async def get_public_key():
+    """Return the RSA public key for client-side password encryption."""
+    return {"public_key": _RSA_PUBLIC_PEM}
 
 # ── JWT settings from .env ────────────────────────────────────────────────────
 _SECRET    = os.environ.get("SECRET_KEY", "change-me")
@@ -231,18 +273,20 @@ class MeUpdate(BaseModel):
 @router.post("/login")
 async def login(req: LoginReq, request: Request):
     """
-    Universal login — checks user_auth first, then admin_users.
-    After 3 failed attempts in 30 minutes, OTP is required.
-    Returns JWT access_token + user info.
+    Universal login with graduated security:
+      Attempt 1: normal 401
+      Attempt 2: 401 + suggest forgot-password
+      Attempt 3 (wrong password): SUSPEND account
+      Attempt 3 (correct password): require OTP
+        OTP correct → login success
+        OTP wrong after 2 resends → SUSPEND account
     """
-    _LOGIN_FAIL_THRESHOLD = 3
-    _LOGIN_FAIL_WINDOW_MIN = 30
-
     client_ip = request.client.host if request.client else "unknown"
+    password = decrypt_password(req.password)
     pool = await get_pool()
     async with pool.acquire() as conn:
 
-        # ── Step 0: Check failed attempt count ─────────────────────────────
+        # ── Count recent failures (30-min window) ──────────────────────────
         fail_count = await conn.fetchval(
             "SELECT COUNT(*) FROM login_attempts"
             " WHERE email=$1 AND purpose='login' AND success=FALSE"
@@ -250,17 +294,79 @@ async def login(req: LoginReq, request: Request):
             req.email,
         ) or 0
 
-        otp_required = fail_count >= _LOGIN_FAIL_THRESHOLD
+        # ── Check if account is already suspended ──────────────────────────
+        ua_row = await conn.fetchrow(
+            "SELECT id, status FROM user_auth WHERE email=$1", req.email
+        )
+        admin_row = await conn.fetchrow(
+            "SELECT id, status FROM admin_users WHERE email=$1", req.email
+        )
+        if ua_row and ua_row["status"] == "suspended":
+            raise HTTPException(
+                status_code=403,
+                detail="Account suspended. Contact your administrator to reactivate.",
+            )
+        if admin_row and admin_row["status"] != "active":
+            raise HTTPException(
+                status_code=403,
+                detail="Account suspended. Contact a superadmin to reactivate.",
+            )
 
-        if otp_required:
+        # ── OTP-required phase (fail_count >= 2) ──────────────────────────
+        if fail_count >= 2:
+            # First verify that the password is actually correct
+            # before sending OTP. Wrong password at this stage → suspend.
+            matched_row, matched_type = None, None
+            user_row = await conn.fetchrow(
+                "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit,"
+                " t.logo_url, t.company, t.status AS tenant_status,"
+                " t.suspension_reason, t.domain_verified"
+                " FROM user_auth ua JOIN tenants t ON ua.tenant_id = t.id"
+                " WHERE ua.email = $1 AND ua.status = 'active'",
+                req.email,
+            )
+            if user_row and verify_password(password, user_row["password_hash"]):
+                matched_row, matched_type = user_row, "user"
+            else:
+                adm_row = await conn.fetchrow(
+                    "SELECT * FROM admin_users WHERE email=$1 AND status='active'",
+                    req.email,
+                )
+                if adm_row and verify_password(password, adm_row["password_hash"]):
+                    matched_row, matched_type = adm_row, "admin"
+
+            if not matched_row:
+                # 3rd+ wrong password → SUSPEND tenant user accounts only (never admin/superadmin)
+                await conn.execute(
+                    "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+                    " VALUES ($1, $2, FALSE, 'login')",
+                    req.email, client_ip,
+                )
+                if ua_row:
+                    await conn.execute(
+                        "UPDATE user_auth SET status='suspended', updated_at=NOW()"
+                        " WHERE email=$1", req.email
+                    )
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Account suspended due to multiple failed login attempts. Contact administrator.",
+                    )
+                # Admin/superadmin — never auto-suspend, just reject
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid email or password",
+                )
+
+            # Password is correct — now require OTP
             if not req.otp:
-                # Send OTP and tell client to retry with OTP
+                # Send OTP
                 otp_raw = "".join(str(secrets.randbelow(10)) for _ in range(6))
                 otp_hash = hashlib.sha256(otp_raw.encode()).hexdigest()
 
                 # Invalidate any previous login OTPs
                 await conn.execute(
-                    "UPDATE otps SET used=TRUE WHERE email=$1 AND purpose='login_verify' AND used=FALSE",
+                    "UPDATE otps SET used=TRUE"
+                    " WHERE email=$1 AND purpose='login_verify' AND used=FALSE",
                     req.email,
                 )
                 await conn.execute(
@@ -269,52 +375,163 @@ async def login(req: LoginReq, request: Request):
                     secrets.token_hex(8), req.email, otp_hash,
                 )
                 try:
-                    await request.app.state.leads.send_otp_email(req.email, otp_raw, "Login Verification")
+                    await request.app.state.leads.send_otp_email(
+                        req.email, otp_raw, "Login Verification"
+                    )
                 except Exception as e:
                     logger.error(f"Login OTP email failed for {req.email}: {e}")
 
-                raise HTTPException(
-                    status_code=403,
-                    detail="Too many failed attempts. OTP sent to your email.",
+                return JSONResponse(
+                    status_code=428,
+                    content={"detail": "OTP sent to your email for verification.", "requires_otp": True},
                     headers={"X-Requires-OTP": "true"},
                 )
 
             # Verify OTP
             otp_hash = hashlib.sha256(req.otp.encode()).hexdigest()
             otp_row = await conn.fetchrow(
-                "SELECT id FROM otps"
-                " WHERE email=$1 AND otp_hash=$2 AND purpose='login_verify'"
+                "SELECT id, resend_count FROM otps"
+                " WHERE email=$1 AND purpose='login_verify'"
                 "   AND used=FALSE AND expires_at > NOW()"
                 " ORDER BY created_at DESC LIMIT 1",
-                req.email, otp_hash,
+                req.email,
             )
             if not otp_row:
                 raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
-            # Mark OTP as used
-            await conn.execute("UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"])
+            if otp_row and hashlib.sha256(req.otp.encode()).hexdigest() != (
+                await conn.fetchval(
+                    "SELECT otp_hash FROM otps WHERE id=$1", otp_row["id"]
+                )
+            ):
+                # Wrong OTP — increment resend count
+                current_resends = otp_row["resend_count"]
+                if current_resends >= 2:
+                    # 2 resends exhausted → SUSPEND tenant user accounts only
+                    await conn.execute(
+                        "UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"]
+                    )
+                    if ua_row:
+                        await conn.execute(
+                            "UPDATE user_auth SET status='suspended', updated_at=NOW()"
+                            " WHERE email=$1", req.email
+                        )
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Account suspended after multiple failed OTP attempts. Contact administrator.",
+                        )
+                    # Admin/superadmin — never auto-suspend, just invalidate OTP
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Too many failed OTP attempts. Please try logging in again.",
+                    )
 
-        # ── Step 1: Try tenant dashboard user ──────────────────────────────
+                # Allow retry — bump resend count
+                await conn.execute(
+                    "UPDATE otps SET resend_count = resend_count + 1 WHERE id=$1",
+                    otp_row["id"],
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid OTP. {2 - current_resends} resend(s) remaining.",
+                    headers={"X-Requires-OTP": "true"},
+                )
+
+            # OTP hash matches — verify
+            stored_hash = await conn.fetchval(
+                "SELECT otp_hash FROM otps WHERE id=$1", otp_row["id"]
+            )
+            if otp_hash != stored_hash:
+                current_resends = otp_row["resend_count"]
+                if current_resends >= 2:
+                    await conn.execute(
+                        "UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"]
+                    )
+                    if ua_row:
+                        await conn.execute(
+                            "UPDATE user_auth SET status='suspended', updated_at=NOW()"
+                            " WHERE email=$1", req.email
+                        )
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Account suspended after multiple failed OTP attempts.",
+                        )
+                    # Admin/superadmin — never auto-suspend
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Too many failed OTP attempts. Please try logging in again.",
+                    )
+                await conn.execute(
+                    "UPDATE otps SET resend_count = resend_count + 1 WHERE id=$1",
+                    otp_row["id"],
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid OTP. {2 - current_resends} resend(s) remaining.",
+                    headers={"X-Requires-OTP": "true"},
+                )
+
+            # OTP correct — mark used, clear attempts, login
+            await conn.execute("UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"])
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                req.email,
+            )
+
+            # Build response for matched user
+            if matched_type == "user":
+                payload = {
+                    "sub": matched_row["id"], "role": matched_row["role"],
+                    "account_type": "user", "tenant_id": matched_row["tenant_id"],
+                    "plan": matched_row["plan"],
+                }
+                user_out = {
+                    "id": matched_row["id"], "name": matched_row["name"],
+                    "email": matched_row["email"], "role": matched_row["role"],
+                    "account_type": "user", "tenant_id": matched_row["tenant_id"],
+                    "plan": matched_row["plan"],
+                    "ticket_limit": matched_row["tenant_ticket_limit"],
+                    "logo_url": matched_row["logo_url"],
+                    "company": matched_row["company"],
+                    "tenant_status": matched_row["tenant_status"],
+                    "suspension_reason": matched_row.get("suspension_reason"),
+                    "domain_verified": matched_row.get("domain_verified", False),
+                }
+            else:
+                payload = {
+                    "sub": matched_row["id"], "role": matched_row["role"],
+                    "account_type": "admin",
+                }
+                user_out = {
+                    "id": matched_row["id"], "name": matched_row["name"],
+                    "email": matched_row["email"], "role": matched_row["role"],
+                    "account_type": "admin", "ticket_limit": matched_row["ticket_limit"],
+                }
+
+            await conn.execute(
+                f"UPDATE {'user_auth' if matched_type == 'user' else 'admin_users'}"
+                " SET last_active=NOW() WHERE id=$1", matched_row["id"]
+            )
+            session_hrs = await _get_session_hours()
+            return {"access_token": _access_token(payload, session_hrs), "user": user_out}
+
+        # ── Normal login flow (fail_count < 2) ─────────────────────────────
+
+        # Try tenant dashboard user
         row = await conn.fetchrow(
             "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit, t.logo_url, t.company,"
             " t.status AS tenant_status, t.suspension_reason, t.domain_verified"
             " FROM user_auth ua"
             " JOIN tenants t ON ua.tenant_id = t.id"
-            " WHERE ua.email = $1 AND ua.status IN ('active', 'suspended')",
+            " WHERE ua.email = $1 AND ua.status = 'active'",
             req.email,
         )
-        if row and verify_password(req.password, row["password_hash"]):
+        if row and verify_password(password, row["password_hash"]):
             # Success — clear failed attempts
             await conn.execute(
                 "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
                 req.email,
             )
-            await conn.execute(
-                "INSERT INTO login_attempts (email, ip_address, success, purpose)"
-                " VALUES ($1, $2, TRUE, 'login')",
-                req.email, client_ip,
-            )
-
             payload = {
                 "sub":          row["id"],
                 "role":         row["role"],
@@ -343,23 +560,16 @@ async def login(req: LoginReq, request: Request):
             session_hrs = await _get_session_hours()
             return {"access_token": _access_token(payload, session_hrs), "user": user_out}
 
-        # ── Step 2: Try admin / superadmin ─────────────────────────────────
+        # Try admin / superadmin
         row = await conn.fetchrow(
             "SELECT * FROM admin_users WHERE email=$1 AND status='active'",
             req.email,
         )
-        if row and verify_password(req.password, row["password_hash"]):
-            # Success — clear failed attempts
+        if row and verify_password(password, row["password_hash"]):
             await conn.execute(
                 "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
                 req.email,
             )
-            await conn.execute(
-                "INSERT INTO login_attempts (email, ip_address, success, purpose)"
-                " VALUES ($1, $2, TRUE, 'login')",
-                req.email, client_ip,
-            )
-
             payload = {
                 "sub":          row["id"],
                 "role":         row["role"],
@@ -379,14 +589,24 @@ async def login(req: LoginReq, request: Request):
             session_hrs = await _get_session_hours()
             return {"access_token": _access_token(payload, session_hrs), "user": user_out}
 
-        # ── Step 3: Failed login — record attempt ──────────────────────────
+        # ── Failed login — record attempt ──────────────────────────────────
         await conn.execute(
             "INSERT INTO login_attempts (email, ip_address, success, purpose)"
             " VALUES ($1, $2, FALSE, 'login')",
             req.email, client_ip,
         )
+        new_fail_count = fail_count + 1
 
-    raise HTTPException(status_code=401, detail="Invalid email or password")
+        # Graduated response
+        headers = {}
+        if new_fail_count >= 2:
+            headers["X-Suggest-Forgot"] = "true"
+
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid email or password",
+        headers=headers if headers else None,
+    )
 
 
 @router.post("/logout")
@@ -483,7 +703,7 @@ async def register_request_otp(req: RegisterOTPReq, request: Request):
             "website":       req.website,
             "phone":         req.phone or "",
             "country_code":  req.country_code or "+91",
-            "password_hash": hash_password(req.password),
+            "password_hash": hash_password(decrypt_password(req.password)),
             "logo_url":      req.logo_url or "",
         })
 
@@ -667,29 +887,63 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
 @router.post("/forgot-password")
 async def forgot_password(req: ForgotPwdReq, request: Request):
     """
-    Generate a password-reset OTP and send it via email.
-    Locked after 2 attempts per day — admin must unlock via ticket.
+    Password reset request with graduated lockout:
+      - 30-day cooldown since last password change
+      - Attempt 1: send OTP, 2 resends, then lock for 6 hours
+      - Attempt 2 (after 6hr): send OTP, 2 resends, then SUSPEND account
     """
-    _FORGOT_PWD_DAILY_LIMIT = 2
     client_ip = request.client.host if request.client else "unknown"
-
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        # ── Lockout check: count today's forgot-password attempts ──────────
-        today_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM login_attempts"
-            " WHERE email=$1 AND purpose='forgot_password'"
-            "   AND created_at >= CURRENT_DATE",
-            req.email,
-        ) or 0
 
-        if today_count >= _FORGOT_PWD_DAILY_LIMIT:
+    async with pool.acquire() as conn:
+        # ── 30-day cooldown check ──────────────────────────────────────────
+        pwd_changed = await conn.fetchval(
+            "SELECT password_changed_at FROM user_auth WHERE email=$1",
+            req.email,
+        )
+        if not pwd_changed:
+            pwd_changed = await conn.fetchval(
+                "SELECT updated_at FROM admin_users WHERE email=$1",
+                req.email,
+            )
+        if pwd_changed:
+            days_since = (datetime.now(timezone.utc) - pwd_changed).days
+            if days_since < 30:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Password can only be changed once every 30 days. "
+                           f"Try again in {30 - days_since} day(s).",
+                )
+
+        # ── Count forgot-password attempts (last 24 hours) ────────────────
+        attempts = await conn.fetch(
+            "SELECT created_at FROM login_attempts"
+            " WHERE email=$1 AND purpose='forgot_password'"
+            "   AND created_at >= NOW() - INTERVAL '24 hours'"
+            " ORDER BY created_at ASC",
+            req.email,
+        )
+        attempt_count = len(attempts)
+
+        if attempt_count >= 2:
+            # Check if 2nd attempt was also exhausted → SUSPEND
             raise HTTPException(
-                status_code=429,
-                detail="Password reset locked for today. Please raise a support ticket from your company dashboard.",
+                status_code=403,
+                detail="Account suspended. Too many password reset attempts. Contact administrator.",
             )
 
-        # Check user_auth first, then admin_users
+        if attempt_count == 1:
+            # Check 6-hour lockout from first attempt
+            first_attempt_time = attempts[0]["created_at"]
+            hours_elapsed = (datetime.now(timezone.utc) - first_attempt_time).total_seconds() / 3600
+            if hours_elapsed < 6:
+                remaining_hrs = int(6 - hours_elapsed) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Password reset locked. Try again in ~{remaining_hrs} hour(s).",
+                )
+
+        # ── Look up user ───────────────────────────────────────────────────
         user_row = await conn.fetchrow(
             "SELECT id,'user' AS utype FROM user_auth WHERE email=$1 AND status='active'",
             req.email,
@@ -700,7 +954,7 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
                 req.email,
             )
         if not user_row:
-            # Don't reveal whether the email exists — but still record the attempt
+            # Don't reveal whether the email exists — but still record
             await conn.execute(
                 "INSERT INTO login_attempts (email, ip_address, success, purpose)"
                 " VALUES ($1, $2, FALSE, 'forgot_password')",
@@ -708,7 +962,7 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
             )
             return {"message": "If that email is registered, a reset link has been sent."}
 
-        # Record this forgot-password attempt
+        # ── Record attempt ─────────────────────────────────────────────────
         await conn.execute(
             "INSERT INTO login_attempts (email, ip_address, success, purpose)"
             " VALUES ($1, $2, FALSE, 'forgot_password')",
@@ -746,6 +1000,7 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
     logger.info(f"[DEV] OTP for {req.email}: {otp}")
     return {
         "message": "OTP sent (check email)",
+        "attempt": attempt_count + 1,
     }
 
 
@@ -764,18 +1019,28 @@ async def reset_password(req: ResetPwdReq, request: Request):
         if not row:
             raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
-        new_hash = hash_password(req.new_password)
+        new_hash = hash_password(decrypt_password(req.new_password))
         tbl      = "user_auth" if row["user_type"] == "user" else "admin_users"
         await conn.execute(
-            f"UPDATE {tbl} SET password_hash=$1, updated_at=NOW() WHERE id=$2",
+            f"UPDATE {tbl} SET password_hash=$1, password_changed_at=NOW(),"
+            " updated_at=NOW() WHERE id=$2",
             new_hash, row["user_id"],
         )
         await conn.execute(
             "UPDATE password_reset_tokens SET used=TRUE WHERE id=$1", row["id"]
         )
+        # Clear forgot-password lockout attempts on success
+        user_email = await conn.fetchval(
+            f"SELECT email FROM {tbl} WHERE id=$1", row["user_id"]
+        )
+        if user_email:
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='forgot_password'",
+                user_email,
+            )
 
         # Send security alert
-        await request.app.state.leads.send_security_alert(row.get("email") or "User", "Password Reset")
+        await request.app.state.leads.send_security_alert(user_email or "User", "Password Reset")
 
     return {"message": "Password updated successfully"}
 
@@ -795,7 +1060,7 @@ async def request_password_change_otp(
         row = await conn.fetchrow(
             f"SELECT password_hash, email FROM {tbl} WHERE id=$1", current["id"]
         )
-        if not row or not verify_password(req.current_password, row["password_hash"]):
+        if not row or not verify_password(decrypt_password(req.current_password), row["password_hash"]):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
 
         # Generate 6-digit OTP
@@ -811,7 +1076,11 @@ async def request_password_change_otp(
             token_hash, expires_at
         )
 
-        await conn.execute(...)
+        await conn.execute(
+            "UPDATE password_reset_tokens SET used=TRUE"
+            " WHERE user_id=$1 AND used=FALSE",
+            current["id"],
+        )
 
     # Send email
     await request.app.state.leads.send_otp_email(row['email'], otp, "Password Change")
@@ -844,13 +1113,14 @@ async def change_password(
         row = await conn.fetchrow(
             f"SELECT password_hash FROM {tbl} WHERE id=$1", current["id"]
         )
-        if not row or not verify_password(req.current_password, row["password_hash"]):
+        if not row or not verify_password(decrypt_password(req.current_password), row["password_hash"]):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
 
         # Update password
         await conn.execute(
-            f"UPDATE {tbl} SET password_hash=$1, updated_at=NOW() WHERE id=$2",
-            hash_password(req.new_password), current["id"],
+            f"UPDATE {tbl} SET password_hash=$1, password_changed_at=NOW(),"
+            " updated_at=NOW() WHERE id=$2",
+            hash_password(decrypt_password(req.new_password)), current["id"],
         )
         
         # Mark OTP as used

@@ -191,18 +191,19 @@ _PUBLIC_TABLES: list[str] = [
     # ── user_auth (tenant dashboard logins) ───────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS user_auth (
-        id            TEXT        PRIMARY KEY,
-        tenant_id     TEXT        NOT NULL REFERENCES tenants(id),
-        name          TEXT        NOT NULL,
-        email         TEXT        NOT NULL UNIQUE,
-        phone         TEXT,
-        country_code  TEXT        NOT NULL DEFAULT '+91',
-        password_hash TEXT        NOT NULL,
-        role          TEXT        NOT NULL DEFAULT 'owner',
-        status        TEXT        NOT NULL DEFAULT 'active',
-        last_active   TIMESTAMPTZ,
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        id                  TEXT        PRIMARY KEY,
+        tenant_id           TEXT        NOT NULL REFERENCES tenants(id),
+        name                TEXT        NOT NULL,
+        email               TEXT        NOT NULL UNIQUE,
+        phone               TEXT,
+        country_code        TEXT        NOT NULL DEFAULT '+91',
+        password_hash       TEXT        NOT NULL,
+        role                TEXT        NOT NULL DEFAULT 'owner',
+        status              TEXT        NOT NULL DEFAULT 'active',
+        password_changed_at TIMESTAMPTZ,
+        last_active         TIMESTAMPTZ,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
 
@@ -333,6 +334,7 @@ _PUBLIC_TABLES: list[str] = [
         payload       JSONB       NOT NULL DEFAULT '{}'::jsonb,
         expires_at    TIMESTAMPTZ NOT NULL,
         used          BOOLEAN     NOT NULL DEFAULT FALSE,
+        resend_count  INTEGER     NOT NULL DEFAULT 0,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
@@ -489,7 +491,7 @@ _TENANT_TABLES: list[str] = [
         stt_enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
         cv_search_enabled  BOOLEAN     NOT NULL DEFAULT TRUE,
         notification_email TEXT,
-        languages          TEXT        NOT NULL DEFAULT 'en',
+        languages          TEXT        NOT NULL DEFAULT 'en,hi,ta,te,bn,mr,gu,kn,ml,pa,es,fr,de,pt,ar,zh,ja,ko,ru,it',
         updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
@@ -628,6 +630,21 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
             finally:
                 await conn.execute("SET search_path TO public")
             logger.info("  ✅ Template schema 'tenant' created")
+
+            # ── Migrate existing tenants: expand languages default ─────────
+            _all_langs = 'en,hi,ta,te,bn,mr,gu,kn,ml,pa,es,fr,de,pt,ar,zh,ja,ko,ru,it'
+            tenant_schemas = await conn.fetch(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 't_%'"
+            )
+            for row in tenant_schemas:
+                sn = row["schema_name"]
+                try:
+                    await conn.execute(
+                        f'UPDATE "{sn}".widget_configs SET languages=$1 WHERE languages=$2',
+                        _all_langs, 'en'
+                    )
+                except Exception:
+                    pass  # schema may not have widget_configs yet
 
     logger.info("✅ Schema applied")
 

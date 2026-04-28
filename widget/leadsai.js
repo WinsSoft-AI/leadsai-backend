@@ -52,7 +52,7 @@
   } else {
     // Dashboard preview — use the logged-in user's JWT
     var dashToken = null;
-    try { dashToken = localStorage.getItem('oc_token'); } catch (_) { }
+    try { dashToken = localStorage.getItem('la_token'); } catch (_) { }
     if (dashToken) {
       widgetJwt = dashToken;
       _isDashboardPreview = true;
@@ -148,11 +148,11 @@
   };
 
   // ── Session / visitor IDs ───────────────────────────────────────
-  var SESSION_ID = 'oc_' + Math.random().toString(36).substr(2, 12);
+  var SESSION_ID = 'la_' + Math.random().toString(36).substr(2, 12);
   var VISITOR_ID = (function () {
     try {
-      var v = localStorage.getItem('oc_vid');
-      if (!v) { v = 'v_' + Math.random().toString(36).substr(2, 16); localStorage.setItem('oc_vid', v); }
+      var v = localStorage.getItem('la_vid');
+      if (!v) { v = 'v_' + Math.random().toString(36).substr(2, 16); localStorage.setItem('la_vid', v); }
       return v;
     } catch (e) { return 'v_' + Math.random().toString(36).substr(2, 16); }
   })();
@@ -209,8 +209,9 @@
     '.hdr-actions{display:flex;gap:6px}',
     '.hdr-btn{background:rgba(255,255,255,.15);border:none;width:32px;height:32px;border-radius:50%;color:white;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:background .15s;outline:none}',
     '.hdr-btn:hover{background:rgba(255,255,255,.25)}',
-    '.lang-sel{border:none;background:none;font-size:12px;color:rgba(255,255,255,.7);cursor:pointer;outline:none;padding:0 2px}',
-    '.lang-sel option{color:#1e293b;background:white}',
+    '.lang-sel{border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.1);font-size:12px;color:white;cursor:pointer;outline:none;padding:4px 6px;border-radius:6px;max-width:110px;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'6\' viewBox=\'0 0 10 6\'%3E%3Cpath d=\'M0 0l5 6 5-6z\' fill=\'rgba(255,255,255,0.7)\'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center;padding-right:18px}',
+    '.lang-sel:hover{background:rgba(255,255,255,.2)}',
+    '.lang-sel option{color:#1e293b;background:white;padding:4px 8px}',
 
     /* Messages */
     '.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth;background:' + cfg.bgColor + '} ' + (cfg.bgImage ? `.messages{background-image:url('${cfg.bgImage}');background-size:cover;background-position:center}` : ""),
@@ -293,8 +294,8 @@
     '.send-btn{background:linear-gradient(135deg,' + cfg.color1 + ',' + cfg.color2 + ');color:white}',
     '.send-btn:hover{opacity:.9;transform:scale(1.05)}',
     '.send-btn:disabled{opacity:.5;cursor:not-allowed;transform:none}',
-    // '.mic-btn.recording{background:#ef4444;color:white;animation:micPulse 1.2s ease-in-out infinite}',
-    // '@keyframes micPulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}',
+    '.mic-btn.recording{background:#ef4444;color:white;animation:micPulse 1.2s ease-in-out infinite}',
+    '@keyframes micPulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}',
     '.powered{text-align:center;font-size:11px;color:#94a3b8;padding-top:6px}',
     '.powered a{color:' + cfg.color2 + ';text-decoration:none}',
 
@@ -337,7 +338,18 @@
           <div class="hdr-actions">
             <select class="lang-sel" id="langSel">
               <option value="auto">🌐 Auto</option>
-              ${cfg.langs.split(',').map(l => `<option value="${l.trim()}">${l.trim().toUpperCase()}</option>`).join('')}
+              ${(function () {
+      var _langMap = {
+        en: 'English', hi: 'हिन्दी', ta: 'தமிழ்', te: 'తెలుగు', bn: 'বাংলা',
+        mr: 'मराठी', gu: 'ગુજરાતી', kn: 'ಕನ್ನಡ', ml: 'മലയാളം', pa: 'ਪੰਜਾਬੀ',
+        es: 'Español', fr: 'Français', de: 'Deutsch', pt: 'Português',
+        ar: 'العربية', zh: '中文', ja: '日本語', ko: '한국어', ru: 'Русский', it: 'Italiano'
+      };
+      return cfg.langs.split(',').map(function (l) {
+        var c = l.trim(); var name = _langMap[c] || c.toUpperCase();
+        return '<option value="' + c + '">' + name + '</option>';
+      }).join('');
+    })()}
             </select>
             <button class="hdr-btn" id="closeBtn" title="Close">✕</button>
           </div>
@@ -356,7 +368,7 @@
             <button class="plus-item" id="pmGallery"><span class="p-ico">🖼️</span> Upload Image</button>
           </div>
           <textarea class="input-box" id="inputBox" placeholder="Ask me anything..." rows="1"></textarea>
-          <button class="act-btn mic-btn" id="micBtn" title="Voice input">
+          <button class="act-btn mic-btn" id="micBtn" title="Voice input" style="display: ${cfg.stt ? 'flex' : 'none'};">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 15c1.66 0 2.99-1.34 2.99-3L15 6c0-1.66-1.34-3-3-3S9 4.34 9 6v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 15 6.7 12H5c0 3.41 2.72 6.23 6 6.72V21h2v-2.28c3.28-.49 6-3.31 6-6.72h-1.7z"/></svg>
           </button>
           <button class="act-btn send-btn" id="sendBtn">➤</button>

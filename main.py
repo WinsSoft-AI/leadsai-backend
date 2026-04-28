@@ -72,6 +72,24 @@ ADMIN  (JWT — admin|superadmin)
   GET  /admin/clients/{client_id}/domains
   GET  /admin/clients/{client_id}/usage
   GET  /admin/clients/{client_id}/tickets
+  GET  /admin/clients/{client_id}/users
+  PUT  /admin/clients/{client_id}/users/{user_id}
+  POST /admin/clients/{client_id}/users/{user_id}/suspend
+  POST /admin/clients/{client_id}/users/{user_id}/unsuspend
+  GET  /admin/clients/{client_id}/audit-log
+  GET  /admin/clients/{client_id}/knowledge/list
+  POST /admin/clients/{client_id}/knowledge/ingest
+  POST /admin/clients/{client_id}/knowledge/qa
+  DELETE /admin/clients/{client_id}/knowledge/{doc_id}
+  DELETE /admin/clients/{client_id}/knowledge/qa/{qa_id}
+  GET  /admin/clients/{client_id}/kb/company
+  PUT  /admin/clients/{client_id}/kb/company
+  GET  /admin/clients/{client_id}/kb/products
+  POST /admin/clients/{client_id}/kb/products
+  PUT  /admin/clients/{client_id}/kb/products/{product_id}
+  DELETE /admin/clients/{client_id}/kb/products/{product_id}
+  POST /admin/clients/{client_id}/kb/products/upload-image
+  POST /admin/clients/{client_id}/kb/sync
   POST /admin/clients/{client_id}/request-domain-otp
   POST /admin/clients/{client_id}/add-domain    ← requires tenant OTP
   DELETE /admin/clients/{client_id}/domains/{domain_id}
@@ -143,7 +161,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from auth import (
     get_current_user, require_admin, require_superadmin,
-    router as auth_router,
+    router as auth_router, decrypt_password,
 )
 from db import (
     close_pool, get_pool, hash_password,
@@ -264,10 +282,11 @@ app = FastAPI(
 )
 
 _origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+_has_wildcard = "*" in _origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins if _origins else ["*"],
-    allow_credentials=bool(_origins),  # only True when explicit origins are set
+    allow_origins=["*"] if _has_wildcard else (_origins if _origins else ["*"]),
+    allow_credentials=not _has_wildcard,  # credentials=True is incompatible with wildcard "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1619,7 +1638,7 @@ async def get_analytics(
 @app.get("/v1/leads/intents", tags=["Dashboard"])
 async def get_lead_intents(current: dict = Depends(get_current_user)):
     _must_be_user(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         rows = await conn.fetch(
             "SELECT DISTINCT intent FROM leads WHERE tenant_id=$1 AND intent IS NOT NULL ORDER BY intent",
             current["tenant_id"]
@@ -1640,7 +1659,7 @@ async def get_leads(
     _must_be_user(current)
     pool   = await get_pool()
     offset = (page - 1) * limit
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         conds:  list[str] = ["l.tenant_id=$1"]
         params: list      = [current["tenant_id"]]
         if filter == "anon":
@@ -1674,7 +1693,7 @@ async def get_leads(
 @app.get("/v1/leads/{lead_id}/conversation", tags=["Dashboard"])
 async def lead_conversation(lead_id: str, current: dict = Depends(get_current_user)):
     _must_be_user(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         row = await conn.fetchrow(
             "SELECT * FROM leads WHERE id=$1 AND tenant_id=$2",
             lead_id, current["tenant_id"],
@@ -1744,7 +1763,7 @@ async def lead_conversation(lead_id: str, current: dict = Depends(get_current_us
 @app.get("/v1/knowledge/list", tags=["Dashboard"])
 async def list_knowledge(current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         rows = await conn.fetch(
             "SELECT * FROM ingest_jobs WHERE tenant_id=$1 ORDER BY created_at DESC",
             current["tenant_id"],
@@ -1757,7 +1776,7 @@ async def get_knowledge_status(current: dict = Depends(get_current_user)):
     tid = current["tenant_id"]
     
     # 1. Check SQL metadata
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         row = await conn.fetchrow(
             "SELECT COUNT(*) as doc_count, SUM(chunks_indexed) as sql_chunks "
             "FROM ingest_jobs WHERE tenant_id=$1 AND status='completed'",
@@ -1797,7 +1816,7 @@ async def get_knowledge_status(current: dict = Depends(get_current_user)):
 @app.get("/v1/knowledge/qa", tags=["Dashboard"])
 async def list_qa(current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         rows = await conn.fetch(
             "SELECT * FROM knowledge_qa WHERE tenant_id=$1 ORDER BY created_at DESC",
             current["tenant_id"],
@@ -1808,7 +1827,7 @@ async def list_qa(current: dict = Depends(get_current_user)):
 async def add_qa(req: KnowledgeQACreate, current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
     qa_id = secrets.token_hex(8)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         async with conn.transaction():
             await conn.execute(
                 "INSERT INTO knowledge_qa (id, tenant_id, question, answer) VALUES ($1, $2, $3, $4)",
@@ -1830,7 +1849,7 @@ async def add_qa(req: KnowledgeQACreate, current: dict = Depends(get_current_use
 @app.delete("/v1/knowledge/qa/{qa_id}", tags=["Dashboard"])
 async def delete_qa(qa_id: str, current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         # verify ownership
         row = await conn.fetchrow(
             "SELECT id FROM knowledge_qa WHERE id=$1 AND tenant_id=$2",
@@ -1854,7 +1873,7 @@ async def delete_qa(qa_id: str, current: dict = Depends(get_current_user)):
 @app.delete("/v1/knowledge/{doc_id}", tags=["Dashboard"])
 async def delete_document(doc_id: str, current: dict = Depends(get_current_user)):
     _must_be_owner_or_member(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         row = await conn.fetchrow(
             "SELECT id FROM ingest_jobs WHERE id=$1 AND tenant_id=$2",
             doc_id, current["tenant_id"],
@@ -1950,7 +1969,7 @@ async def kb_get_company(current: dict = Depends(get_current_user)):
     """Fetch all company data fields for the current tenant."""
     _must_be_user(current)
     tid = current["tenant_id"]
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         rows = await conn.fetch(
             "SELECT id, section, field_key, field_value, display_order "
             "FROM kb_company_data WHERE tenant_id=$1 ORDER BY section, display_order",
@@ -1964,7 +1983,7 @@ async def kb_update_company(req: CompanyDataUpdate, current: dict = Depends(get_
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
 
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         async with conn.transaction():
             for idx, item in enumerate(req.data):
                 # Validate section
@@ -2011,7 +2030,7 @@ async def kb_list_products(current: dict = Depends(get_current_user)):
     """List all products for the current tenant."""
     _must_be_user(current)
     tid = current["tenant_id"]
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         rows = await conn.fetch(
             "SELECT * FROM kb_products WHERE tenant_id=$1 ORDER BY category, name", tid,
         )
@@ -2027,7 +2046,7 @@ async def kb_create_product(req: ProductCreate, current: dict = Depends(get_curr
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
     pid = secrets.token_hex(8)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         await conn.execute(
             "INSERT INTO kb_products (id, tenant_id, category, sub_category, name, description, "
             "image_url, pricing, min_order_qty, source_url) "
@@ -2043,7 +2062,7 @@ async def kb_update_product(product_id: str, req: ProductUpdate, current: dict =
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
 
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         existing = await conn.fetchrow(
             "SELECT id, image_url FROM kb_products WHERE id=$1 AND tenant_id=$2", product_id, tid,
         )
@@ -2079,7 +2098,7 @@ async def kb_delete_product(product_id: str, current: dict = Depends(get_current
     """Delete a product."""
     _must_be_owner_or_member(current)
     tid = current["tenant_id"]
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         row = await conn.fetchrow(
             "SELECT id, image_url FROM kb_products WHERE id=$1 AND tenant_id=$2", product_id, tid,
         )
@@ -2161,7 +2180,7 @@ async def kb_sync_vectors(current: dict = Depends(get_current_user)):
     import hashlib
     chunks = []
 
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         # 1. Company data → one chunk per section
         company_rows = await conn.fetch(
             "SELECT section, field_key, field_value FROM kb_company_data "
@@ -2282,7 +2301,7 @@ class _WidgetUpdate(BaseModel):
 @app.get("/v1/widget-config", tags=["Dashboard"])
 async def get_widget_config_dashboard(current: dict = Depends(get_current_user)):
     _must_be_owner(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         row = await conn.fetchrow(
             "SELECT wc.* FROM widget_configs wc WHERE wc.tenant_id=$1",
             current["tenant_id"],
@@ -2302,9 +2321,17 @@ async def update_widget_config(body: _WidgetUpdate, current: dict = Depends(get_
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields provided")
+
+    # ── Plan-based feature gating: starter/trial cannot enable CV or voice ──
+    plan = current.get("plan", "trial")
+    if plan in ("starter", "trial"):
+        if "cv_search_enabled" in updates:
+            updates["cv_search_enabled"] = False
+        if "stt_enabled" in updates:
+            updates["stt_enabled"] = False
         
     pool   = await get_pool()
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         # Check old URLs to delete if replaced or cleared
         if "logo_url" in updates or "bg_image_url" in updates:
             existing = await conn.fetchrow(
@@ -2384,7 +2411,7 @@ async def get_widget_embed(request: Request, current: dict = Depends(get_current
     _must_be_owner(current)
     tid  = current["tenant_id"]
 
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         cfg = await conn.fetchrow(
             "SELECT wc.*, t.name AS business_name, t.plan, t.widget_slug"
             " FROM widget_configs wc"
@@ -2500,7 +2527,7 @@ async def create_order(req: _OrderReq):
     cfg = await get_plan(req.plan)
     if not cfg:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {req.plan}")
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         row = await conn.fetchrow("SELECT id FROM tenants WHERE email=$1", req.email)
         if row:
             tid = row["id"]
@@ -2551,7 +2578,7 @@ _email_otps: dict[str, dict] = {}
 @app.get("/v1/settings", tags=["Dashboard"])
 async def get_settings(current: dict = Depends(get_current_user)):
     _must_be_user(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         tenant = await conn.fetchrow(
             "SELECT name, email, company, phone, country_code, domain, logo_url, plan, status,"
             " notification_emails, created_at FROM tenants WHERE id=$1",
@@ -2615,7 +2642,7 @@ async def get_settings(current: dict = Depends(get_current_user)):
 async def update_settings(body: _SettingsUpdate, current: dict = Depends(get_current_user)):
     _must_be_user(current)
     _must_not_be_suspended(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         async with conn.transaction():
             # Update user name (any role can update their own name)
             if body.name:
@@ -2704,7 +2731,7 @@ async def upload_tenant_logo(
         cache_control="public, max-age=300"
     )
 
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         async with conn.transaction():
             await conn.execute(
                 "UPDATE tenants SET logo_url=$1, updated_at=NOW() WHERE id=$2",
@@ -2828,7 +2855,7 @@ async def add_member(body: _MemberCreate, current: dict = Depends(get_current_us
             " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             mid, current["tenant_id"], body.name, body.email,
             body.phone, body.country_code,
-            hash_password(body.password), body.role,
+            hash_password(decrypt_password(body.password)), body.role,
         )
     return {"id": mid, "name": body.name, "email": body.email, "role": body.role,
             "phone": body.phone, "country_code": body.country_code}
@@ -2837,7 +2864,7 @@ async def add_member(body: _MemberCreate, current: dict = Depends(get_current_us
 async def update_member(member_id: str, body: _MemberUpdate,
                         current: dict = Depends(get_current_user)):
     _must_be_owner(current)
-    async with tenant_conn(tid) as conn:
+    async with tenant_conn(current["tenant_id"]) as conn:
         row = await conn.fetchrow(
             "SELECT id, role FROM user_auth WHERE id=$1 AND tenant_id=$2",
             member_id, current["tenant_id"],
@@ -3454,15 +3481,15 @@ async def admin_list_clients(
             f"""
             SELECT t.id, t.name, t.email, t.company, t.plan, t.status,
                    t.created_at, t.ticket_limit,
-                   (SELECT COUNT(*) FROM sessions s WHERE s.tenant_id=t.id
-                      AND s.started_at >= NOW()-INTERVAL '30 days') AS sessions_month,
-                   (SELECT COUNT(*) FROM leads l WHERE l.tenant_id=t.id
-                      AND l.created_at >= NOW()-INTERVAL '30 days') AS leads_month,
+                   COALESCE(ts.total_sessions, 0) AS sessions_month,
+                   COALESCE(ts.total_leads, 0) AS leads_month,
                    (SELECT COUNT(*) FROM tickets tk WHERE tk.tenant_id=t.id
                       AND tk.status IN ('open','claimed')) AS open_tickets,
                    (SELECT MAX(ua.last_active) FROM user_auth ua
                     WHERE ua.tenant_id=t.id) AS last_active
-              FROM tenants t WHERE {where}
+              FROM tenants t
+              LEFT JOIN tenant_stats ts ON ts.tenant_id = t.id
+             WHERE {where}
              ORDER BY t.created_at DESC
              LIMIT ${len(params)+1} OFFSET ${len(params)+2}
             """,
@@ -3634,6 +3661,17 @@ async def admin_activate(client_id: str, current: dict = Depends(require_admin))
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE tenants SET status='active', updated_at=NOW() WHERE id=$1", client_id
+        )
+        # Also reactivate any suspended user_auth accounts for this tenant
+        await conn.execute(
+            "UPDATE user_auth SET status='active', updated_at=NOW() WHERE tenant_id=$1 AND status='suspended'",
+            client_id,
+        )
+        # Clear login lockout attempts for all tenant users
+        await conn.execute(
+            "DELETE FROM login_attempts WHERE email IN "
+            "(SELECT email FROM user_auth WHERE tenant_id=$1) AND purpose='login'",
+            client_id,
         )
         await _audit(conn, current, "activate_tenant", "tenant", client_id, {}, tenant_id=client_id)
     return {"status": "active"}
@@ -3807,6 +3845,240 @@ async def admin_unlock_password_reset(
                      {"email": owner["email"]}, tenant_id=client_id)
 
     return {"status": "unlocked", "email": owner["email"]}
+
+
+# ── Admin tenant user management ──────────────────────────────────────────────
+
+@app.get("/admin/clients/{client_id}/users", tags=["Admin"])
+async def admin_list_users(client_id: str, current: dict = Depends(require_admin)):
+    """List all user_auth rows for a tenant."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name, email, phone, role, status, last_active, created_at"
+            " FROM user_auth WHERE tenant_id=$1 ORDER BY created_at",
+            client_id,
+        )
+    return {"users": [dict(r) for r in rows]}
+
+
+class _AdminUserUpdate(BaseModel):
+    name:   Optional[str] = None
+    email:  Optional[str] = None
+    phone:  Optional[str] = None
+
+
+@app.put("/admin/clients/{client_id}/users/{user_id}", tags=["Admin"])
+async def admin_update_user(
+    client_id: str, user_id: str,
+    body: _AdminUserUpdate,
+    current: dict = Depends(require_admin),
+):
+    """Modify a tenant member's name, email, or phone. Cannot modify owners."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, role FROM user_auth WHERE id=$1 AND tenant_id=$2",
+            user_id, client_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["role"] == "owner":
+            raise HTTPException(status_code=403, detail="Cannot modify owner accounts. Contact superadmin.")
+
+        updates, params = [], []
+        if body.name:
+            params.append(body.name); updates.append(f"name=${len(params)}")
+        if body.email:
+            params.append(body.email); updates.append(f"email=${len(params)}")
+        if body.phone is not None:
+            params.append(body.phone); updates.append(f"phone=${len(params)}")
+        if not updates:
+            raise HTTPException(status_code=400, detail="Nothing to update")
+
+        updates.append("updated_at=NOW()")
+        params.append(user_id)
+        await conn.execute(
+            f"UPDATE user_auth SET {', '.join(updates)} WHERE id=${len(params)}",
+            *params,
+        )
+        await _audit(conn, current, "admin_update_tenant_user", "user", user_id,
+                     {"tenant_id": client_id, **body.dict(exclude_none=True)},
+                     tenant_id=client_id)
+
+    return {"status": "updated"}
+
+
+@app.post("/admin/clients/{client_id}/users/{user_id}/suspend", tags=["Admin"])
+async def admin_suspend_user(
+    client_id: str, user_id: str, current: dict = Depends(require_admin),
+):
+    """Suspend a tenant member account. Cannot suspend owners."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, role, status FROM user_auth WHERE id=$1 AND tenant_id=$2",
+            user_id, client_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["role"] == "owner":
+            raise HTTPException(status_code=403, detail="Cannot suspend owner. Contact superadmin.")
+        if row["status"] == "suspended":
+            raise HTTPException(status_code=400, detail="User is already suspended")
+
+        await conn.execute(
+            "UPDATE user_auth SET status='suspended', updated_at=NOW() WHERE id=$1",
+            user_id,
+        )
+        await _audit(conn, current, "admin_suspend_tenant_user", "user", user_id,
+                     {"tenant_id": client_id}, tenant_id=client_id)
+
+    return {"status": "suspended"}
+
+
+@app.post("/admin/clients/{client_id}/users/{user_id}/unsuspend", tags=["Admin"])
+async def admin_unsuspend_user(
+    client_id: str, user_id: str, current: dict = Depends(require_admin),
+):
+    """Reactivate a suspended tenant member account."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, role, status FROM user_auth WHERE id=$1 AND tenant_id=$2",
+            user_id, client_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["status"] == "active":
+            raise HTTPException(status_code=400, detail="User is already active")
+
+        await conn.execute(
+            "UPDATE user_auth SET status='active', updated_at=NOW() WHERE id=$1",
+            user_id,
+        )
+        # Also clear any login lockout attempts
+        email = await conn.fetchval(
+            "SELECT email FROM user_auth WHERE id=$1", user_id
+        )
+        if email:
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                email,
+            )
+        await _audit(conn, current, "admin_unsuspend_tenant_user", "user", user_id,
+                     {"tenant_id": client_id}, tenant_id=client_id)
+
+    return {"status": "active"}
+
+
+# ── Admin tenant audit log ────────────────────────────────────────────────────
+
+@app.get("/admin/clients/{client_id}/audit-log", tags=["Admin"])
+async def admin_client_audit_log(
+    client_id: str, current: dict = Depends(require_admin),
+):
+    """Return last 100 audit log entries for a tenant."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT al.*, "
+            "  COALESCE(ua.name, au.name, 'System') AS actor_name,"
+            "  COALESCE(ua.email, au.email) AS actor_email"
+            " FROM audit_log al"
+            " LEFT JOIN user_auth ua ON ua.id = al.actor_id"
+            " LEFT JOIN admin_users au ON au.id = al.actor_id"
+            " WHERE al.tenant_id=$1"
+            " ORDER BY al.created_at DESC LIMIT 100",
+            client_id,
+        )
+    return {"audit_log": [dict(r) for r in rows]}
+
+
+# ── Admin knowledge base (shared logic with superadmin) ───────────────────────
+
+@app.get("/admin/clients/{client_id}/knowledge/list", tags=["Admin"])
+async def admin_list_knowledge(client_id: str, current: dict = Depends(require_admin)):
+    """List KB docs and Q/A for a client — admin access."""
+    return await sa_list_knowledge(client_id, current)
+
+
+@app.post("/admin/clients/{client_id}/knowledge/ingest", tags=["Admin"])
+async def admin_ingest_document(
+    client_id: str, file: UploadFile = File(...), current: dict = Depends(require_admin),
+):
+    """Upload document for a client — admin access."""
+    return await sa_ingest_document(client_id, file, current)
+
+
+@app.post("/admin/clients/{client_id}/knowledge/qa", tags=["Admin"])
+async def admin_add_qa(client_id: str, req: KnowledgeQACreate, current: dict = Depends(require_admin)):
+    """Add Q/A pair for a client — admin access."""
+    return await sa_add_qa(client_id, req, current)
+
+
+@app.delete("/admin/clients/{client_id}/knowledge/qa/{qa_id}", tags=["Admin"])
+async def admin_delete_qa(client_id: str, qa_id: str, current: dict = Depends(require_admin)):
+    """Delete Q/A for a client — admin access."""
+    return await sa_delete_qa(client_id, qa_id, current)
+
+
+@app.delete("/admin/clients/{client_id}/knowledge/{doc_id}", tags=["Admin"])
+async def admin_delete_document(client_id: str, doc_id: str, current: dict = Depends(require_admin)):
+    """Delete doc for a client — admin access."""
+    return await sa_delete_document(client_id, doc_id, current)
+
+
+@app.get("/admin/clients/{client_id}/kb/company", tags=["Admin"])
+async def admin_kb_get_company(client_id: str, current: dict = Depends(require_admin)):
+    """Get company data for a client — admin access."""
+    return await sa_kb_get_company(client_id, current)
+
+
+@app.put("/admin/clients/{client_id}/kb/company", tags=["Admin"])
+async def admin_kb_update_company(client_id: str, req: CompanyDataUpdate, current: dict = Depends(require_admin)):
+    """Update company data for a client — admin access."""
+    return await sa_kb_update_company(client_id, req, current)
+
+
+@app.get("/admin/clients/{client_id}/kb/products", tags=["Admin"])
+async def admin_kb_list_products(client_id: str, current: dict = Depends(require_admin)):
+    """List products for a client — admin access."""
+    return await sa_kb_list_products(client_id, current)
+
+
+@app.post("/admin/clients/{client_id}/kb/products", status_code=201, tags=["Admin"])
+async def admin_kb_create_product(client_id: str, req: ProductCreate, current: dict = Depends(require_admin)):
+    """Create product for a client — admin access."""
+    return await sa_kb_create_product(client_id, req, current)
+
+
+@app.put("/admin/clients/{client_id}/kb/products/{product_id}", tags=["Admin"])
+async def admin_kb_update_product(
+    client_id: str, product_id: str, req: ProductUpdate, current: dict = Depends(require_admin),
+):
+    """Update product for a client — admin access."""
+    return await sa_kb_update_product(client_id, product_id, req, current)
+
+
+@app.delete("/admin/clients/{client_id}/kb/products/{product_id}", tags=["Admin"])
+async def admin_kb_delete_product(client_id: str, product_id: str, current: dict = Depends(require_admin)):
+    """Delete product for a client — admin access."""
+    return await sa_kb_delete_product(client_id, product_id, current)
+
+
+@app.post("/admin/clients/{client_id}/kb/products/upload-image", tags=["Admin"])
+async def admin_kb_upload_product_image(
+    client_id: str, file: UploadFile = File(...), current: dict = Depends(require_admin),
+):
+    """Upload product image for a client — admin access."""
+    return await sa_kb_upload_product_image(client_id, file, current)
+
+
+@app.post("/admin/clients/{client_id}/kb/sync", tags=["Admin"])
+async def admin_kb_sync_vectors(client_id: str, current: dict = Depends(require_admin)):
+    """Trigger vector sync for a client — admin access."""
+    return await sa_kb_sync_vectors(client_id, current)
 
 
 # ── Admin tickets ──────────────────────────────────────────────────────────────
@@ -4078,8 +4350,12 @@ async def admin_analytics(days: int = 30, current: dict = Depends(require_admin)
             AND EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = t.id AND p.status='captured')
         """) or 0
         
-        sessions_today = await conn.fetchval("SELECT COUNT(*) FROM sessions WHERE started_at >= CURRENT_DATE")
-        leads_today = await conn.fetchval("SELECT COUNT(*) FROM leads WHERE created_at >= CURRENT_DATE")
+        sessions_today = await conn.fetchval(
+            "SELECT COALESCE(SUM(total_sessions), 0) FROM tenant_stats"
+        ) or 0
+        leads_today = await conn.fetchval(
+            "SELECT COALESCE(SUM(total_leads), 0) FROM tenant_stats"
+        ) or 0
         open_tickets = await conn.fetchval("SELECT COUNT(*) FROM tickets WHERE status='open' OR status='new'")
 
         from datetime import timedelta, datetime, timezone
@@ -4087,9 +4363,9 @@ async def admin_analytics(days: int = 30, current: dict = Depends(require_admin)
         
         # Trends
         daily_sessions_rows = await conn.fetch("""
-            SELECT TO_CHAR(DATE_TRUNC('day', started_at), 'YYYY-MM-DD') as day, COUNT(*) as count
-            FROM sessions
-            WHERE started_at >= NOW() - $1::interval
+            SELECT TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') as day, COUNT(DISTINCT session_id) as count
+            FROM usage_events
+            WHERE created_at >= NOW() - $1::interval
             GROUP BY day ORDER BY day
         """, td)
         
@@ -4109,11 +4385,10 @@ async def admin_analytics(days: int = 30, current: dict = Depends(require_admin)
 
         # Plan Distribution
         plan_dist_rows = await conn.fetch("""
-            SELECT p.name as plan, COUNT(t.id) as count
+            SELECT t.plan as plan, COUNT(t.id) as count
             FROM tenants t
-            JOIN plans p ON t.plan = p.id
             WHERE t.status='active'
-            GROUP BY p.name
+            GROUP BY t.plan
         """)
 
     total_active_plan = sum(r["count"] for r in plan_dist_rows)
@@ -4730,7 +5005,7 @@ async def sa_create_admin(body: _NewAdmin, current: dict = Depends(require_super
         await conn.execute(
             "INSERT INTO admin_users (id,name,email,password_hash,role,ticket_limit)"
             " VALUES ($1,$2,$3,$4,'admin',$5)",
-            aid, body.name, body.email, hash_password(body.password), limit
+            aid, body.name, body.email, hash_password(decrypt_password(body.password)), limit
         )
         await _audit(conn, current, "create_admin", "admin_user", aid,
                      {"email": body.email, "name": body.name})
@@ -4760,6 +5035,16 @@ async def sa_edit_admin(
         )
         if res == "UPDATE 0":
             raise HTTPException(status_code=404, detail="Admin not found")
+        # If reactivating, clear login lockout attempts
+        if updates.get("status") == "active":
+            email = await conn.fetchval(
+                "SELECT email FROM admin_users WHERE id=$1", admin_id
+            )
+            if email:
+                await conn.execute(
+                    "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                    email,
+                )
         await _audit(conn, current, "edit_admin", "admin_user", admin_id, updates)
     return {"status": "updated", "fields": keys}
 
@@ -5045,16 +5330,20 @@ async def sa_platform_stats(days: int = 30, current: dict = Depends(require_supe
             AND EXISTS (SELECT 1 FROM payments p WHERE p.tenant_id = t.id AND p.status='captured')
         """) or 0
         
-        sessions_today = await conn.fetchval("SELECT COUNT(*) FROM sessions WHERE started_at >= CURRENT_DATE")
-        leads_today = await conn.fetchval("SELECT COUNT(*) FROM leads WHERE created_at >= CURRENT_DATE")
+        sessions_today = await conn.fetchval(
+            "SELECT COALESCE(SUM(total_sessions), 0) FROM tenant_stats"
+        ) or 0
+        leads_today = await conn.fetchval(
+            "SELECT COALESCE(SUM(total_leads), 0) FROM tenant_stats"
+        ) or 0
         open_tickets = await conn.fetchval("SELECT COUNT(*) FROM tickets WHERE status='open' OR status='new'")
 
         td = timedelta(days=days)
         
         daily_sessions_rows = await conn.fetch("""
-            SELECT TO_CHAR(DATE_TRUNC('day', started_at), 'YYYY-MM-DD') as day, COUNT(*) as count
-            FROM sessions
-            WHERE started_at >= NOW() - $1::interval
+            SELECT TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') as day, COUNT(DISTINCT session_id) as count
+            FROM usage_events
+            WHERE created_at >= NOW() - $1::interval
             GROUP BY day ORDER BY day
         """, td)
         
@@ -5073,11 +5362,10 @@ async def sa_platform_stats(days: int = 30, current: dict = Depends(require_supe
         """, td)
 
         plan_dist_rows = await conn.fetch("""
-            SELECT p.name as plan, COUNT(t.id) as count
+            SELECT t.plan as plan, COUNT(t.id) as count
             FROM tenants t
-            JOIN plans p ON t.plan = p.id
             WHERE t.status='active'
-            GROUP BY p.name
+            GROUP BY t.plan
         """)
 
     total_active_plan = sum(r["count"] for r in plan_dist_rows)

@@ -76,6 +76,7 @@ ADMIN  (JWT — admin|superadmin)
   PUT  /admin/clients/{client_id}/users/{user_id}
   POST /admin/clients/{client_id}/users/{user_id}/suspend
   POST /admin/clients/{client_id}/users/{user_id}/unsuspend
+  POST /admin/clients/{client_id}/users/{user_id}/unlock
   GET  /admin/clients/{client_id}/audit-log
   GET  /admin/clients/{client_id}/knowledge/list
   POST /admin/clients/{client_id}/knowledge/ingest
@@ -3662,9 +3663,9 @@ async def admin_activate(client_id: str, current: dict = Depends(require_admin))
         await conn.execute(
             "UPDATE tenants SET status='active', updated_at=NOW() WHERE id=$1", client_id
         )
-        # Also reactivate any suspended user_auth accounts for this tenant
+        # Also reactivate any suspended or locked user_auth accounts for this tenant
         await conn.execute(
-            "UPDATE user_auth SET status='active', updated_at=NOW() WHERE tenant_id=$1 AND status='suspended'",
+            "UPDATE user_auth SET status='active', updated_at=NOW() WHERE tenant_id=$1 AND status IN ('suspended','locked')",
             client_id,
         )
         # Clear login lockout attempts for all tenant users
@@ -3941,7 +3942,7 @@ async def admin_suspend_user(
 async def admin_unsuspend_user(
     client_id: str, user_id: str, current: dict = Depends(require_admin),
 ):
-    """Reactivate a suspended tenant member account."""
+    """Reactivate a suspended or locked tenant member account."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -3966,7 +3967,39 @@ async def admin_unsuspend_user(
                 "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
                 email,
             )
-        await _audit(conn, current, "admin_unsuspend_tenant_user", "user", user_id,
+        action = "admin_unlock_tenant_user" if row["status"] == "locked" else "admin_unsuspend_tenant_user"
+        await _audit(conn, current, action, "user", user_id,
+                     {"tenant_id": client_id, "previous_status": row["status"]}, tenant_id=client_id)
+
+    return {"status": "active"}
+
+
+@app.post("/admin/clients/{client_id}/users/{user_id}/unlock", tags=["Admin"])
+async def admin_unlock_user(
+    client_id: str, user_id: str, current: dict = Depends(require_admin),
+):
+    """Unlock a locked tenant member account (convenience alias for unsuspend)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, status, email FROM user_auth WHERE id=$1 AND tenant_id=$2",
+            user_id, client_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["status"] != "locked":
+            raise HTTPException(status_code=400, detail=f"User is not locked (current status: {row['status']})")
+
+        await conn.execute(
+            "UPDATE user_auth SET status='active', updated_at=NOW() WHERE id=$1",
+            user_id,
+        )
+        if row["email"]:
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                row["email"],
+            )
+        await _audit(conn, current, "admin_unlock_tenant_user", "user", user_id,
                      {"tenant_id": client_id}, tenant_id=client_id)
 
     return {"status": "active"}

@@ -273,70 +273,76 @@ class MeUpdate(BaseModel):
 @router.post("/login")
 async def login(req: LoginReq, request: Request):
     """
-    Universal login with graduated security:
+    Universal login with graduated security (tenant users only):
       Attempt 1: normal 401
       Attempt 2: 401 + suggest forgot-password
-      Attempt 3 (wrong password): SUSPEND account
+      Attempt 3 (wrong password): LOCK account (status='locked')
       Attempt 3 (correct password): require OTP
         OTP correct → login success
-        OTP wrong after 2 resends → SUSPEND account
+        OTP wrong after 2 resends → LOCK account
+
+    Admins/superadmins: unlimited attempts, no OTP, no locking.
+    Suspended users: allowed to login (dashboard overlay handles restrictions).
+    Locked users: login blocked entirely (HTTP 423).
     """
     client_ip = request.client.host if request.client else "unknown"
     password = decrypt_password(req.password)
     pool = await get_pool()
     async with pool.acquire() as conn:
 
-        # ── Count recent failures (30-min window) ──────────────────────────
-        fail_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM login_attempts"
-            " WHERE email=$1 AND purpose='login' AND success=FALSE"
-            "   AND created_at > NOW() - INTERVAL '30 minutes'",
-            req.email,
-        ) or 0
-
-        # ── Check if account is already suspended ──────────────────────────
+        # ── Pre-check account status ───────────────────────────────────────
         ua_row = await conn.fetchrow(
             "SELECT id, status FROM user_auth WHERE email=$1", req.email
         )
         admin_row = await conn.fetchrow(
             "SELECT id, status FROM admin_users WHERE email=$1", req.email
         )
-        if ua_row and ua_row["status"] == "suspended":
+
+        # Locked → 423 (tenant users only, never admins)
+        if ua_row and ua_row["status"] == "locked":
             raise HTTPException(
-                status_code=403,
-                detail="Account suspended. Contact your administrator to reactivate.",
+                status_code=423,
+                detail="Account locked due to multiple failed login attempts. Please raise a support ticket to unlock your account.",
             )
+        # Admin inactive → 403
         if admin_row and admin_row["status"] != "active":
             raise HTTPException(
                 status_code=403,
                 detail="Account suspended. Contact a superadmin to reactivate.",
             )
+        # NOTE: suspended tenant users are ALLOWED to login — the dashboard
+        # overlay will show the suspension reason and restrict access.
 
-        # ── OTP-required phase (fail_count >= 2) ──────────────────────────
+        # ── Count recent failures (30-min window) — tenant users only ──────
+        # Admin/superadmin accounts are exempt from fail counting entirely.
+        is_admin_account = admin_row is not None
+        fail_count = 0
+        if not is_admin_account:
+            fail_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM login_attempts"
+                " WHERE email=$1 AND purpose='login' AND success=FALSE"
+                "   AND created_at > NOW() - INTERVAL '30 minutes'",
+                req.email,
+            ) or 0
+
+        # ── OTP-required phase (fail_count >= 2, tenant users only) ────────
         if fail_count >= 2:
             # First verify that the password is actually correct
-            # before sending OTP. Wrong password at this stage → suspend.
+            # before sending OTP. Wrong password at this stage → LOCK.
             matched_row, matched_type = None, None
             user_row = await conn.fetchrow(
                 "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit,"
                 " t.logo_url, t.company, t.status AS tenant_status,"
                 " t.suspension_reason, t.domain_verified"
                 " FROM user_auth ua JOIN tenants t ON ua.tenant_id = t.id"
-                " WHERE ua.email = $1 AND ua.status = 'active'",
+                " WHERE ua.email = $1 AND ua.status IN ('active','suspended')",
                 req.email,
             )
             if user_row and verify_password(password, user_row["password_hash"]):
                 matched_row, matched_type = user_row, "user"
-            else:
-                adm_row = await conn.fetchrow(
-                    "SELECT * FROM admin_users WHERE email=$1 AND status='active'",
-                    req.email,
-                )
-                if adm_row and verify_password(password, adm_row["password_hash"]):
-                    matched_row, matched_type = adm_row, "admin"
 
             if not matched_row:
-                # 3rd+ wrong password → SUSPEND tenant user accounts only (never admin/superadmin)
+                # 3rd+ wrong password → LOCK tenant user account
                 await conn.execute(
                     "INSERT INTO login_attempts (email, ip_address, success, purpose)"
                     " VALUES ($1, $2, FALSE, 'login')",
@@ -344,14 +350,13 @@ async def login(req: LoginReq, request: Request):
                 )
                 if ua_row:
                     await conn.execute(
-                        "UPDATE user_auth SET status='suspended', updated_at=NOW()"
+                        "UPDATE user_auth SET status='locked', updated_at=NOW()"
                         " WHERE email=$1", req.email
                     )
                     raise HTTPException(
-                        status_code=403,
-                        detail="Account suspended due to multiple failed login attempts. Contact administrator.",
+                        status_code=423,
+                        detail="Account locked due to multiple failed login attempts. Please raise a support ticket to unlock your account.",
                     )
-                # Admin/superadmin — never auto-suspend, just reject
                 raise HTTPException(
                     status_code=401,
                     detail="Invalid email or password",
@@ -407,20 +412,19 @@ async def login(req: LoginReq, request: Request):
                 # Wrong OTP — increment resend count
                 current_resends = otp_row["resend_count"]
                 if current_resends >= 2:
-                    # 2 resends exhausted → SUSPEND tenant user accounts only
+                    # 2 resends exhausted → LOCK tenant user account
                     await conn.execute(
                         "UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"]
                     )
                     if ua_row:
                         await conn.execute(
-                            "UPDATE user_auth SET status='suspended', updated_at=NOW()"
+                            "UPDATE user_auth SET status='locked', updated_at=NOW()"
                             " WHERE email=$1", req.email
                         )
                         raise HTTPException(
-                            status_code=403,
-                            detail="Account suspended after multiple failed OTP attempts. Contact administrator.",
+                            status_code=423,
+                            detail="Account locked after multiple failed OTP attempts. Please raise a support ticket to unlock your account.",
                         )
-                    # Admin/superadmin — never auto-suspend, just invalidate OTP
                     raise HTTPException(
                         status_code=400,
                         detail="Too many failed OTP attempts. Please try logging in again.",
@@ -449,14 +453,13 @@ async def login(req: LoginReq, request: Request):
                     )
                     if ua_row:
                         await conn.execute(
-                            "UPDATE user_auth SET status='suspended', updated_at=NOW()"
+                            "UPDATE user_auth SET status='locked', updated_at=NOW()"
                             " WHERE email=$1", req.email
                         )
                         raise HTTPException(
-                            status_code=403,
-                            detail="Account suspended after multiple failed OTP attempts.",
+                            status_code=423,
+                            detail="Account locked after multiple failed OTP attempts. Please raise a support ticket to unlock your account.",
                         )
-                    # Admin/superadmin — never auto-suspend
                     raise HTTPException(
                         status_code=400,
                         detail="Too many failed OTP attempts. Please try logging in again.",
@@ -513,17 +516,20 @@ async def login(req: LoginReq, request: Request):
                 " SET last_active=NOW() WHERE id=$1", matched_row["id"]
             )
             session_hrs = await _get_session_hours()
-            return {"access_token": _access_token(payload, session_hrs), "user": user_out}
+            return {
+                "access_token": _access_token(payload, session_hrs),
+                "user": user_out,
+            }
 
         # ── Normal login flow (fail_count < 2) ─────────────────────────────
 
-        # Try tenant dashboard user
+        # Try tenant dashboard user (active OR suspended — both can login)
         row = await conn.fetchrow(
             "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit, t.logo_url, t.company,"
             " t.status AS tenant_status, t.suspension_reason, t.domain_verified"
             " FROM user_auth ua"
             " JOIN tenants t ON ua.tenant_id = t.id"
-            " WHERE ua.email = $1 AND ua.status = 'active'",
+            " WHERE ua.email = $1 AND ua.status IN ('active','suspended')",
             req.email,
         )
         if row and verify_password(password, row["password_hash"]):
@@ -558,7 +564,10 @@ async def login(req: LoginReq, request: Request):
                 "UPDATE user_auth SET last_active=NOW() WHERE id=$1", row["id"]
             )
             session_hrs = await _get_session_hours()
-            return {"access_token": _access_token(payload, session_hrs), "user": user_out}
+            return {
+                "access_token": _access_token(payload, session_hrs),
+                "user": user_out,
+            }
 
         # Try admin / superadmin
         row = await conn.fetchrow(
@@ -587,7 +596,10 @@ async def login(req: LoginReq, request: Request):
                 "UPDATE admin_users SET last_active=NOW() WHERE id=$1", row["id"]
             )
             session_hrs = await _get_session_hours()
-            return {"access_token": _access_token(payload, session_hrs), "user": user_out}
+            return {
+                "access_token": _access_token(payload, session_hrs),
+                "user": user_out,
+            }
 
         # ── Failed login — record attempt ──────────────────────────────────
         await conn.execute(
@@ -1134,3 +1146,74 @@ async def change_password(
         await _audit(conn, current, "change_password", "user", current["id"], {}, tenant_id=current.get("tenant_id"))
 
     return {"message": "Password changed successfully"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LOCKED ACCOUNT TICKET  (unauthenticated — only for locked tenant users)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class LockedTicketReq(BaseModel):
+    email: str
+    context: str = ""
+
+
+@router.post("/locked-ticket", status_code=201)
+async def locked_ticket(req: LockedTicketReq):
+    """
+    Unauthenticated endpoint for LOCKED tenant users to raise a support ticket.
+    Only works when the user_auth row for the email has status='locked'.
+    Limited to 1 open locked-ticket per email to prevent abuse.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 1. Verify user exists and is locked
+        row = await conn.fetchrow(
+            "SELECT ua.id, ua.tenant_id, ua.name FROM user_auth ua"
+            " WHERE ua.email=$1 AND ua.status='locked'",
+            req.email,
+        )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="No locked account found for this email.",
+            )
+
+        user_id   = row["id"]
+        tenant_id = row["tenant_id"]
+        user_name = row["name"]
+
+        # 2. Rate limit: max 1 open locked-ticket per email
+        existing = await conn.fetchval(
+            "SELECT COUNT(*) FROM tickets"
+            " WHERE user_id=$1 AND type='locked_account'"
+            "   AND status IN ('open','claimed')",
+            user_id,
+        )
+        if existing and existing > 0:
+            raise HTTPException(
+                status_code=429,
+                detail="A support ticket for this account is already open. Our team will contact you shortly.",
+            )
+
+        # 3. Create the ticket
+        tid = secrets.token_hex(10)
+        heading = "Account Locked — Login Issue"
+        context = req.context.strip() if req.context else "User account was locked due to multiple failed login attempts."
+
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO tickets (id,tenant_id,user_id,heading,context,type,priority)"
+                " VALUES ($1,$2,$3,$4,$5,'locked_account','high')",
+                tid, tenant_id, user_id, heading, context,
+            )
+            await conn.execute(
+                "INSERT INTO ticket_status_log"
+                " (ticket_id,changed_by,changer_role,from_status,to_status,note)"
+                " VALUES ($1,$2,'user','none','open','Auto-created: locked account')",
+                tid, user_id,
+            )
+
+    return {
+        "ticket_id": tid,
+        "message": f"Support ticket created successfully. Our team will review your account and contact you at {req.email}.",
+    }

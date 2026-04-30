@@ -107,6 +107,8 @@ _PUBLIC_TABLES: list[str] = [
         domain_verified  BOOLEAN     NOT NULL DEFAULT FALSE,
         verification_token TEXT,
         suspension_reason TEXT,
+        onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
+        terms_accepted       BOOLEAN NOT NULL DEFAULT FALSE,
         created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )

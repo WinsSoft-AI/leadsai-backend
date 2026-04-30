@@ -117,6 +117,9 @@ class S3StorageService(StorageService):
         self._bucket = os.getenv("S3_BUCKET", "winssoft-bma")
         self._region = os.getenv("S3_REGION", "ap-south-1")
         self._cdn_url = os.getenv("S3_CDN_URL", "").rstrip("/")
+        # Ensure CDN URL has https:// scheme
+        if self._cdn_url and not self._cdn_url.startswith(("http://", "https://")):
+            self._cdn_url = f"https://{self._cdn_url}"
 
         self._client = boto3.client(
             "s3",
@@ -183,8 +186,6 @@ class S3StorageService(StorageService):
 
     def get_url(self, key: str, expires_in: int = 3600) -> str:
         """Generate a presigned URL for private S3 access."""
-        if self._cdn_url:
-            return f"{self._cdn_url}/{key}"
         return self._client.generate_presigned_url(
             "get_object",
             Params={"Bucket": self._bucket, "Key": key},

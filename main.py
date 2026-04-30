@@ -231,6 +231,7 @@ async def _check_expired_trials():
                         " WHERE tenant_id=$1",
                         t["id"],
                     )
+                    await _audit(conn, {"id": "system", "role": "system"}, "suspend_tenant", "tenant", t["id"], {"reason": "trial_expired", "tenant_email": t["email"]}, tenant_id=t["id"])
                     logger.info(f"⏰ Trial expired: tenant={t['id']} email={t['email']}")
 
                 if expired:
@@ -282,12 +283,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-_has_wildcard = "*" in _origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if _has_wildcard else (_origins if _origins else ["*"]),
-    allow_credentials=not _has_wildcard,  # credentials=True is incompatible with wildcard "*"
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -2374,6 +2373,7 @@ async def get_asset(strkey: str = Query(..., alias="key")):
 @app.post("/v1/upload", tags=["Dashboard"])
 async def upload_file(
     file: UploadFile = File(...),
+    prefix: str = Form("widget_bg"),
     current: dict = Depends(get_current_user)
 ):
     """Upload a generic file (e.g. background image) and return its public URL."""
@@ -2390,7 +2390,11 @@ async def upload_file(
 
     raw_name = file.filename or "upload"
     ext = Path(raw_name).suffix or ".png"
-    key = f"tenants/{current['tenant_id']}/widget/bg_{secrets.token_hex(8)}{ext}"
+    
+    if prefix == "custom_logo":
+        key = f"image_data/custom_logo_url/{secrets.token_hex(8)}{ext}"
+    else:
+        key = f"image_data/widget_bg/{secrets.token_hex(8)}{ext}"
 
     actual_key = await app.state.s3.upload(
         key=key,
@@ -2491,6 +2495,19 @@ async def get_widget_embed(request: Request, current: dict = Depends(get_current
         "install_guide":      install_guide,
     }
 
+@app.post("/v1/onboarding/complete", tags=["Dashboard"])
+async def complete_onboarding(current: dict = Depends(get_current_user)):
+    """Mark onboarding as completed for the tenant."""
+    _must_be_owner(current)
+    tid = current["tenant_id"]
+    
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE tenants SET onboarding_completed=TRUE WHERE id=$1", tid)
+        await _audit(conn, current, "update", "tenants", tid, {"onboarding_completed": True})
+    
+    return {"message": "Onboarding completed successfully"}
+
 # ── Usage / subscription / payments ───────────────────────────────────────────
 @app.get("/v1/usage", tags=["Dashboard"])
 async def get_usage(days: int = 30, current: dict = Depends(get_current_user)):
@@ -2575,6 +2592,20 @@ class _SettingsUpdate(BaseModel):
 
 # In-memory email-change OTP store: { "user_id": {"otp": "123456", "email": "new@x.com", "expires": float} }
 _email_otps: dict[str, dict] = {}
+
+@app.get("/v1/audit-log", tags=["Dashboard"])
+async def tenant_audit_log(current: dict = Depends(get_current_user)):
+    _must_be_owner(current)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT created_at, action, entity_type, entity_id, meta,"
+            " actor_id, actor_role, ip_address"
+            " FROM audit_log WHERE tenant_id=$1"
+            " ORDER BY created_at DESC LIMIT 200",
+            current["tenant_id"]
+        )
+    return {"audit_log": [dict(r) for r in rows]}
 
 @app.get("/v1/settings", tags=["Dashboard"])
 async def get_settings(current: dict = Depends(get_current_user)):
@@ -2858,6 +2889,7 @@ async def add_member(body: _MemberCreate, current: dict = Depends(get_current_us
             body.phone, body.country_code,
             hash_password(decrypt_password(body.password)), body.role,
         )
+        await _audit(conn, current, "create_user", "user", mid, {"user_email": body.email, "user_name": body.name}, tenant_id=current["tenant_id"])
     return {"id": mid, "name": body.name, "email": body.email, "role": body.role,
             "phone": body.phone, "country_code": body.country_code}
 
@@ -3018,8 +3050,9 @@ async def remove_member(member_id: str, current: dict = Depends(get_current_user
             "DELETE FROM user_auth WHERE id=$1 AND tenant_id=$2",
             member_id, current["tenant_id"],
         )
-    if res == "DELETE 0":
-        raise HTTPException(status_code=404, detail="Member not found")
+        if res == "DELETE 0":
+            raise HTTPException(status_code=404, detail="Member not found")
+        await _audit(conn, current, "delete_user", "user", member_id, {}, tenant_id=current["tenant_id"])
     return {"status": "removed", "member_id": member_id}
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3556,7 +3589,7 @@ async def admin_client_usage(
     current:   dict = Depends(require_admin),
 ):
     pool = await get_pool()
-    iv   = f"{days} days"
+    iv   = timedelta(days=days)
     async with pool.acquire() as conn:
         daily = await conn.fetch(
             "SELECT DATE(created_at) AS day, COUNT(*) AS requests,"
@@ -4309,7 +4342,7 @@ async def admin_resolve_ticket(
                 ticket_id, current["id"], body.note,
             )
             await _audit(conn, current, "resolve_ticket", "ticket", ticket_id,
-                         {"note": body.note[:100]})
+                         {"note": body.note[:100]}, tenant_id=ticket["tenant_id"])
     return {"status": "solved"}
 
 @app.post("/admin/tickets/{ticket_id}/mark-read", tags=["Admin"])
@@ -4607,8 +4640,18 @@ async def sa_force_logout(client_id: str, current: dict = Depends(require_supera
 async def sa_delete_client(client_id: str, current: dict = Depends(require_superadmin)):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM tenants WHERE id=$1", client_id)
-        await _audit(conn, current, "delete_tenant", "tenant", client_id, {}, tenant_id=client_id)
+        async with conn.transaction():
+            # 1. Soft delete the tenant (retain row for historical trail)
+            await conn.execute("UPDATE tenants SET status='deleted', updated_at=NOW() WHERE id=$1", client_id)
+            
+            # 2. Delete user accounts to prevent any future logins
+            await conn.execute("DELETE FROM user_auth WHERE tenant_id=$1", client_id)
+            
+            # 3. Drop the tenant-specific schema to wipe all conversational/KB data
+            await conn.execute(f'DROP SCHEMA IF EXISTS "t_{client_id}" CASCADE')
+            
+            await _audit(conn, current, "delete_tenant", "tenant", client_id, {}, tenant_id=client_id)
+            
     await app.state.s3.delete_prefix(f"tenants/{client_id}/")
     await app.state.s3.delete_prefix(f"image_data/logo/{client_id}.")
     await app.state.s3.delete_prefix(f"image_data/products/{client_id}_")

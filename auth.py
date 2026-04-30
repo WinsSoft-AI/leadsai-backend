@@ -172,7 +172,8 @@ async def get_current_user(
             row = await conn.fetchrow(
                 "SELECT ua.id, ua.name, ua.email, ua.role, ua.status, ua.tenant_id,"
                 " t.plan, t.ticket_limit AS tenant_ticket_limit, t.logo_url, t.company,"
-                " t.status AS tenant_status, t.suspension_reason, t.domain_verified"
+                " t.status AS tenant_status, t.suspension_reason, t.domain_verified,"
+                " t.onboarding_completed, t.terms_accepted"
                 " FROM user_auth ua"
                 " JOIN tenants t ON ua.tenant_id = t.id"
                 " WHERE ua.id = $1",
@@ -292,7 +293,7 @@ async def login(req: LoginReq, request: Request):
 
         # ── Pre-check account status ───────────────────────────────────────
         ua_row = await conn.fetchrow(
-            "SELECT id, status FROM user_auth WHERE email=$1", req.email
+            "SELECT id, status, name, tenant_id FROM user_auth WHERE email=$1", req.email
         )
         admin_row = await conn.fetchrow(
             "SELECT id, status FROM admin_users WHERE email=$1", req.email
@@ -353,6 +354,7 @@ async def login(req: LoginReq, request: Request):
                         "UPDATE user_auth SET status='locked', updated_at=NOW()"
                         " WHERE email=$1", req.email
                     )
+                    await _audit(conn, {"id": "system", "role": "system"}, "lock_account", "user", ua_row["id"], {"reason": "too_many_failed_logins", "user_name": ua_row["name"], "user_email": req.email}, tenant_id=ua_row["tenant_id"])
                     raise HTTPException(
                         status_code=423,
                         detail="Account locked due to multiple failed login attempts. Please raise a support ticket to unlock your account.",
@@ -421,6 +423,7 @@ async def login(req: LoginReq, request: Request):
                             "UPDATE user_auth SET status='locked', updated_at=NOW()"
                             " WHERE email=$1", req.email
                         )
+                        await _audit(conn, {"id": "system", "role": "system"}, "lock_account", "user", ua_row["id"], {"reason": "too_many_failed_otps", "user_name": ua_row["name"], "user_email": req.email}, tenant_id=ua_row["tenant_id"])
                         raise HTTPException(
                             status_code=423,
                             detail="Account locked after multiple failed OTP attempts. Please raise a support ticket to unlock your account.",
@@ -456,6 +459,7 @@ async def login(req: LoginReq, request: Request):
                             "UPDATE user_auth SET status='locked', updated_at=NOW()"
                             " WHERE email=$1", req.email
                         )
+                        await _audit(conn, {"id": "system", "role": "system"}, "lock_account", "user", ua_row["id"], {"reason": "too_many_failed_otps", "user_name": ua_row["name"], "user_email": req.email}, tenant_id=ua_row["tenant_id"])
                         raise HTTPException(
                             status_code=423,
                             detail="Account locked after multiple failed OTP attempts. Please raise a support ticket to unlock your account.",
@@ -810,8 +814,8 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
             await conn.execute(
                 "INSERT INTO tenants"
                 " (id,name,email,company,domain,logo_url,phone,country_code,plan,status,"
-                "  ticket_limit,widget_slug,widget_secret,domain_verified,suspension_reason)"
-                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'trial',$9,$10,$11,$12,$13,$14)",
+                "  ticket_limit,widget_slug,widget_secret,domain_verified,suspension_reason,terms_accepted)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'trial',$9,$10,$11,$12,$13,$14,TRUE)",
                 tid, name, req.email, c_name, website, logo_url,
                 phone, country_code, tenant_status, tlimit, w_slug, w_secret,
                 domain_verified, suspension_reason,

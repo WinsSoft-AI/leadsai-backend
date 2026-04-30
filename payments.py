@@ -90,7 +90,7 @@ class RazorpayService:
         order = self._client.order.create({
             "amount":   amount * 100,
             "currency": cfg["currency"],
-            "receipt":  f"oc_{tenant_id[:8]}_{secrets.token_hex(4)}",
+            "receipt":  f"la_{tenant_id[:8]}_{secrets.token_hex(4)}",
             "notes":    {"tenant_id": tenant_id, "plan": plan},
         })
 

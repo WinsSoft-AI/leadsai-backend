@@ -35,6 +35,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from db import hash_password, close_pool, get_pool, create_tenant_schema
 
 from dotenv import load_dotenv
 
@@ -105,6 +106,8 @@ _PUBLIC_TABLES: list[str] = [
         domain_verified  BOOLEAN     NOT NULL DEFAULT FALSE,
         verification_token TEXT,
         suspension_reason TEXT,
+        onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
+        terms_accepted       BOOLEAN NOT NULL DEFAULT FALSE,
         created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
@@ -189,18 +192,19 @@ _PUBLIC_TABLES: list[str] = [
     # ── user_auth (tenant dashboard logins) ───────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS user_auth (
-        id            TEXT        PRIMARY KEY,
-        tenant_id     TEXT        NOT NULL REFERENCES tenants(id),
-        name          TEXT        NOT NULL,
-        email         TEXT        NOT NULL UNIQUE,
-        phone         TEXT,
-        country_code  TEXT        NOT NULL DEFAULT '+91',
-        password_hash TEXT        NOT NULL,
-        role          TEXT        NOT NULL DEFAULT 'owner',
-        status        TEXT        NOT NULL DEFAULT 'active',
-        last_active   TIMESTAMPTZ,
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        id                  TEXT        PRIMARY KEY,
+        tenant_id           TEXT        NOT NULL REFERENCES tenants(id),
+        name                TEXT        NOT NULL,
+        email               TEXT        NOT NULL UNIQUE,
+        phone               TEXT,
+        country_code        TEXT        NOT NULL DEFAULT '+91',
+        password_hash       TEXT        NOT NULL,
+        role                TEXT        NOT NULL DEFAULT 'owner',
+        status              TEXT        NOT NULL DEFAULT 'active',
+        password_changed_at TIMESTAMPTZ,
+        last_active         TIMESTAMPTZ,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
 
@@ -331,6 +335,7 @@ _PUBLIC_TABLES: list[str] = [
         payload       JSONB       NOT NULL DEFAULT '{}'::jsonb,
         expires_at    TIMESTAMPTZ NOT NULL,
         used          BOOLEAN     NOT NULL DEFAULT FALSE,
+        resend_count  INTEGER     NOT NULL DEFAULT 0,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
@@ -349,6 +354,31 @@ _PUBLIC_TABLES: list[str] = [
         last_session_at TIMESTAMPTZ,
         last_lead_at    TIMESTAMPTZ,
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+
+    # ── tenant_domains (multi-domain CORS whitelist per tenant) ────────────────
+    """
+    CREATE TABLE IF NOT EXISTS tenant_domains (
+        id         TEXT        PRIMARY KEY,
+        tenant_id  TEXT        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        domain     TEXT        NOT NULL,
+        added_by   TEXT        NOT NULL,
+        verified   BOOLEAN     NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(tenant_id, domain)
+    )
+    """,
+
+    # ── login_attempts (brute-force tracking for login + forgot-password) ──────
+    """
+    CREATE TABLE IF NOT EXISTS login_attempts (
+        id         BIGSERIAL   PRIMARY KEY,
+        email      TEXT        NOT NULL,
+        ip_address TEXT,
+        success    BOOLEAN     NOT NULL DEFAULT FALSE,
+        purpose    TEXT        NOT NULL DEFAULT 'login',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
 ]
@@ -462,7 +492,7 @@ _TENANT_TABLES: list[str] = [
         stt_enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
         cv_search_enabled  BOOLEAN     NOT NULL DEFAULT TRUE,
         notification_email TEXT,
-        languages          TEXT        NOT NULL DEFAULT 'en',
+        languages          TEXT        NOT NULL DEFAULT 'en,hi,ta,te,bn,mr,gu,kn,ml,pa,es,fr,de,pt,ar,zh,ja,ko,ru,it',
         updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
@@ -530,6 +560,10 @@ _PUBLIC_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_pwd_reset_hash        ON password_reset_tokens(token_hash)",
     "CREATE INDEX IF NOT EXISTS idx_otp_email             ON otps(email)",
     "CREATE INDEX IF NOT EXISTS idx_otp_purpose           ON otps(email, purpose)",
+    "CREATE INDEX IF NOT EXISTS idx_tenant_domains_tid    ON tenant_domains(tenant_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_domains_unique ON tenant_domains(tenant_id, domain)",
+    "CREATE INDEX IF NOT EXISTS idx_login_attempts_email  ON login_attempts(email, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_login_attempts_purpose ON login_attempts(email, purpose, created_at DESC)",
 ]
 
 # Indexes for tenant schema tables — applied to both the template and each tenant schema
@@ -573,20 +607,12 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
                     await conn.execute(f'DROP SCHEMA IF EXISTS "{row["schema_name"]}" CASCADE')
                 logger.info(f"  Dropped {len(schemas)} tenant schema(s)")
 
-                # Drop public tables in dependency order
-                drops = [
-                    "tenant_stats",
-                    "audit_log", "platform_settings",
-                    "ticket_status_log", "ticket_messages",
-                    "ticket_attachments", "tickets",
-                    "password_reset_tokens", "otps",
-                    "admin_users", "user_auth",
-                    "usage_events",
-                    "billing_cycles", "payments", "subscriptions",
-                    "tenants", "plans",
-                ]
-                for t in drops:
-                    await conn.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+                # Drop all public tables dynamically
+                pub_tables = await conn.fetch(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                )
+                for pt in pub_tables:
+                    await conn.execute(f'DROP TABLE IF EXISTS "{pt["tablename"]}" CASCADE')
                 logger.info("  All public tables dropped")
 
             # ── Create public schema tables ──────────────────────────────
@@ -597,16 +623,30 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
 
             # ── Create 'tenant' template schema ──────────────────────────
             await conn.execute("CREATE SCHEMA IF NOT EXISTS tenant")
-            for stmt in _TENANT_TABLES:
-                tpl = stmt.replace(
-                    "CREATE TABLE IF NOT EXISTS ",
-                    "CREATE TABLE IF NOT EXISTS tenant."
-                )
-                await conn.execute(tpl)
-            for idx in _TENANT_INDEXES:
-                tpl = idx.replace(" ON ", " ON tenant.")
-                await conn.execute(tpl)
+            await conn.execute("SET search_path TO tenant, public")
+            try:
+                for stmt in _TENANT_TABLES:
+                    await conn.execute(stmt)
+                for idx in _TENANT_INDEXES:
+                    await conn.execute(idx)
+            finally:
+                await conn.execute("SET search_path TO public")
             logger.info("  ✅ Template schema 'tenant' created")
+
+            # ── Migrate existing tenants: expand languages default ─────────
+            _all_langs = 'en,hi,ta,te,bn,mr,gu,kn,ml,pa,es,fr,de,pt,ar,zh,ja,ko,ru,it'
+            tenant_schemas = await conn.fetch(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 't_%'"
+            )
+            for row in tenant_schemas:
+                sn = row["schema_name"]
+                try:
+                    await conn.execute(
+                        f'UPDATE "{sn}".widget_configs SET languages=$1 WHERE languages=$2',
+                        _all_langs, 'en'
+                    )
+                except Exception:
+                    pass  # schema may not have widget_configs yet
 
     logger.info("✅ Schema applied")
 
@@ -631,7 +671,6 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
-    from db import hash_password
     async with pool.acquire() as conn:
         async with conn.transaction():
 
@@ -677,6 +716,7 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                 ("product_import_template", default_template),
                 ("generic_email_domains",   "gmail.com,yahoo.com,yahoo.co.in,outlook.com,hotmail.com,aol.com,icloud.com,mail.com,protonmail.com,zoho.com,yandex.com,gmx.com,live.com,rediffmail.com"),
                 ("queries_email",           ""),
+                ("dashboard_origins",       ""),
             ]
             await conn.executemany(
                 "INSERT INTO platform_settings (key, value) VALUES ($1, $2)"
@@ -733,7 +773,7 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                     " VALUES ($1,$2,'pro','active',7900,$3,$4)",
                     sub, tid, now, end,
                 )
-
+                
                 # Create tenant schema and insert widget_configs there
                 await create_tenant_schema(conn, tid)
                 await conn.execute(
@@ -777,7 +817,6 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                     " VALUES ($1,'Test Shop',$2,'Test Ltd','starter','active',2)",
                     st, st_email,
                 )
-
                 # Create tenant schema and insert widget_configs
                 await create_tenant_schema(conn, st)
                 await conn.execute(
@@ -798,13 +837,12 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                     " VALUES ($1,$2,'Shop Owner',$3,$4,'owner')",
                     secrets.token_hex(8), st, st_email, hash_password("Test123!"),
                 )
-
+                
                 # tenant_stats row
                 await conn.execute(
                     "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
                     " ON CONFLICT (tenant_id) DO NOTHING", st
                 )
-
                 logger.info("  ✅ test@shop.com / Test123!  (Starter plan)")
             
             # ── test ticket with attachment ──────────────────────────────────

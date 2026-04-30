@@ -31,10 +31,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncpg
+import base64
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
+
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
+from cryptography.hazmat.primitives import serialization, hashes
 
 from db import (
     get_pool,
@@ -55,6 +60,43 @@ except ImportError:
 logger   = logging.getLogger(__name__)
 router   = APIRouter(prefix="/auth", tags=["Auth"])
 _bearer  = HTTPBearer(auto_error=False)
+
+# ── RSA keypair for password encryption in transit ─────────────────────────────
+_RSA_PRIVATE_KEY = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
+_RSA_PUBLIC_KEY = _RSA_PRIVATE_KEY.public_key()
+_RSA_PUBLIC_PEM = _RSA_PUBLIC_KEY.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+).decode()
+
+logger.info("RSA keypair generated for password encryption in transit")
+
+
+def decrypt_password(encrypted_b64: str) -> str:
+    """Decrypt an RSA-OAEP encrypted password sent from the frontend."""
+    try:
+        ciphertext = base64.b64decode(encrypted_b64)
+        plaintext = _RSA_PRIVATE_KEY.decrypt(
+            ciphertext,
+            asym_padding.OAEP(
+                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return plaintext.decode("utf-8")
+    except Exception as e:
+        logger.error(f"Password decryption failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid encrypted password")
+
+
+@router.get("/public-key")
+async def get_public_key():
+    """Return the RSA public key for client-side password encryption."""
+    return {"public_key": _RSA_PUBLIC_PEM}
 
 # ── JWT settings from .env ────────────────────────────────────────────────────
 _SECRET    = os.environ.get("SECRET_KEY", "change-me")
@@ -130,7 +172,8 @@ async def get_current_user(
             row = await conn.fetchrow(
                 "SELECT ua.id, ua.name, ua.email, ua.role, ua.status, ua.tenant_id,"
                 " t.plan, t.ticket_limit AS tenant_ticket_limit, t.logo_url, t.company,"
-                " t.status AS tenant_status, t.suspension_reason, t.domain_verified"
+                " t.status AS tenant_status, t.suspension_reason, t.domain_verified,"
+                " t.onboarding_completed, t.terms_accepted"
                 " FROM user_auth ua"
                 " JOIN tenants t ON ua.tenant_id = t.id"
                 " WHERE ua.id = $1",
@@ -180,6 +223,7 @@ require_superadmin = require_role("superadmin")
 class LoginReq(BaseModel):
     email:    EmailStr
     password: str
+    otp:      Optional[str] = None  # Required after 3 failed attempts
 
 
 class RegisterOTPReq(BaseModel):
@@ -228,24 +272,276 @@ class MeUpdate(BaseModel):
 # ═════════════════════════════════════════════════════════════════════════════
 
 @router.post("/login")
-async def login(req: LoginReq):
+async def login(req: LoginReq, request: Request):
     """
-    Universal login — checks user_auth first, then admin_users.
-    Returns JWT access_token + user info.
+    Universal login with graduated security (tenant users only):
+      Attempt 1: normal 401
+      Attempt 2: 401 + suggest forgot-password
+      Attempt 3 (wrong password): LOCK account (status='locked')
+      Attempt 3 (correct password): require OTP
+        OTP correct → login success
+        OTP wrong after 2 resends → LOCK account
+
+    Admins/superadmins: unlimited attempts, no OTP, no locking.
+    Suspended users: allowed to login (dashboard overlay handles restrictions).
+    Locked users: login blocked entirely (HTTP 423).
     """
+    client_ip = request.client.host if request.client else "unknown"
+    password = decrypt_password(req.password)
     pool = await get_pool()
     async with pool.acquire() as conn:
 
-        # Try tenant dashboard user
+        # ── Pre-check account status ───────────────────────────────────────
+        ua_row = await conn.fetchrow(
+            "SELECT id, status, name, tenant_id FROM user_auth WHERE email=$1", req.email
+        )
+        admin_row = await conn.fetchrow(
+            "SELECT id, status FROM admin_users WHERE email=$1", req.email
+        )
+
+        # Locked → 423 (tenant users only, never admins)
+        if ua_row and ua_row["status"] == "locked":
+            raise HTTPException(
+                status_code=423,
+                detail="Account locked due to multiple failed login attempts. Please raise a support ticket to unlock your account.",
+            )
+        # Admin inactive → 403
+        if admin_row and admin_row["status"] != "active":
+            raise HTTPException(
+                status_code=403,
+                detail="Account suspended. Contact a superadmin to reactivate.",
+            )
+        # NOTE: suspended tenant users are ALLOWED to login — the dashboard
+        # overlay will show the suspension reason and restrict access.
+
+        # ── Count recent failures (30-min window) — tenant users only ──────
+        # Admin/superadmin accounts are exempt from fail counting entirely.
+        is_admin_account = admin_row is not None
+        fail_count = 0
+        if not is_admin_account:
+            fail_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM login_attempts"
+                " WHERE email=$1 AND purpose='login' AND success=FALSE"
+                "   AND created_at > NOW() - INTERVAL '30 minutes'",
+                req.email,
+            ) or 0
+
+        # ── OTP-required phase (fail_count >= 2, tenant users only) ────────
+        if fail_count >= 2:
+            # First verify that the password is actually correct
+            # before sending OTP. Wrong password at this stage → LOCK.
+            matched_row, matched_type = None, None
+            user_row = await conn.fetchrow(
+                "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit,"
+                " t.logo_url, t.company, t.status AS tenant_status,"
+                " t.suspension_reason, t.domain_verified"
+                " FROM user_auth ua JOIN tenants t ON ua.tenant_id = t.id"
+                " WHERE ua.email = $1 AND ua.status IN ('active','suspended')",
+                req.email,
+            )
+            if user_row and verify_password(password, user_row["password_hash"]):
+                matched_row, matched_type = user_row, "user"
+
+            if not matched_row:
+                # 3rd+ wrong password → LOCK tenant user account
+                await conn.execute(
+                    "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+                    " VALUES ($1, $2, FALSE, 'login')",
+                    req.email, client_ip,
+                )
+                if ua_row:
+                    await conn.execute(
+                        "UPDATE user_auth SET status='locked', updated_at=NOW()"
+                        " WHERE email=$1", req.email
+                    )
+                    await _audit(conn, {"id": "system", "role": "system"}, "lock_account", "user", ua_row["id"], {"reason": "too_many_failed_logins", "user_name": ua_row["name"], "user_email": req.email}, tenant_id=ua_row["tenant_id"])
+                    raise HTTPException(
+                        status_code=423,
+                        detail="Account locked due to multiple failed login attempts. Please raise a support ticket to unlock your account.",
+                    )
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid email or password",
+                )
+
+            # Password is correct — now require OTP
+            if not req.otp:
+                # Send OTP
+                otp_raw = "".join(str(secrets.randbelow(10)) for _ in range(6))
+                otp_hash = hashlib.sha256(otp_raw.encode()).hexdigest()
+
+                # Invalidate any previous login OTPs
+                await conn.execute(
+                    "UPDATE otps SET used=TRUE"
+                    " WHERE email=$1 AND purpose='login_verify' AND used=FALSE",
+                    req.email,
+                )
+                await conn.execute(
+                    "INSERT INTO otps (id, email, otp_hash, purpose, expires_at)"
+                    " VALUES ($1,$2,$3,'login_verify', NOW() + INTERVAL '5 minutes')",
+                    secrets.token_hex(8), req.email, otp_hash,
+                )
+                try:
+                    await request.app.state.leads.send_otp_email(
+                        req.email, otp_raw, "Login Verification"
+                    )
+                except Exception as e:
+                    logger.error(f"Login OTP email failed for {req.email}: {e}")
+
+                return JSONResponse(
+                    status_code=428,
+                    content={"detail": "OTP sent to your email for verification.", "requires_otp": True},
+                    headers={"X-Requires-OTP": "true"},
+                )
+
+            # Verify OTP
+            otp_hash = hashlib.sha256(req.otp.encode()).hexdigest()
+            otp_row = await conn.fetchrow(
+                "SELECT id, resend_count FROM otps"
+                " WHERE email=$1 AND purpose='login_verify'"
+                "   AND used=FALSE AND expires_at > NOW()"
+                " ORDER BY created_at DESC LIMIT 1",
+                req.email,
+            )
+            if not otp_row:
+                raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+            if otp_row and hashlib.sha256(req.otp.encode()).hexdigest() != (
+                await conn.fetchval(
+                    "SELECT otp_hash FROM otps WHERE id=$1", otp_row["id"]
+                )
+            ):
+                # Wrong OTP — increment resend count
+                current_resends = otp_row["resend_count"]
+                if current_resends >= 2:
+                    # 2 resends exhausted → LOCK tenant user account
+                    await conn.execute(
+                        "UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"]
+                    )
+                    if ua_row:
+                        await conn.execute(
+                            "UPDATE user_auth SET status='locked', updated_at=NOW()"
+                            " WHERE email=$1", req.email
+                        )
+                        await _audit(conn, {"id": "system", "role": "system"}, "lock_account", "user", ua_row["id"], {"reason": "too_many_failed_otps", "user_name": ua_row["name"], "user_email": req.email}, tenant_id=ua_row["tenant_id"])
+                        raise HTTPException(
+                            status_code=423,
+                            detail="Account locked after multiple failed OTP attempts. Please raise a support ticket to unlock your account.",
+                        )
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Too many failed OTP attempts. Please try logging in again.",
+                    )
+
+                # Allow retry — bump resend count
+                await conn.execute(
+                    "UPDATE otps SET resend_count = resend_count + 1 WHERE id=$1",
+                    otp_row["id"],
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid OTP. {2 - current_resends} resend(s) remaining.",
+                    headers={"X-Requires-OTP": "true"},
+                )
+
+            # OTP hash matches — verify
+            stored_hash = await conn.fetchval(
+                "SELECT otp_hash FROM otps WHERE id=$1", otp_row["id"]
+            )
+            if otp_hash != stored_hash:
+                current_resends = otp_row["resend_count"]
+                if current_resends >= 2:
+                    await conn.execute(
+                        "UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"]
+                    )
+                    if ua_row:
+                        await conn.execute(
+                            "UPDATE user_auth SET status='locked', updated_at=NOW()"
+                            " WHERE email=$1", req.email
+                        )
+                        await _audit(conn, {"id": "system", "role": "system"}, "lock_account", "user", ua_row["id"], {"reason": "too_many_failed_otps", "user_name": ua_row["name"], "user_email": req.email}, tenant_id=ua_row["tenant_id"])
+                        raise HTTPException(
+                            status_code=423,
+                            detail="Account locked after multiple failed OTP attempts. Please raise a support ticket to unlock your account.",
+                        )
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Too many failed OTP attempts. Please try logging in again.",
+                    )
+                await conn.execute(
+                    "UPDATE otps SET resend_count = resend_count + 1 WHERE id=$1",
+                    otp_row["id"],
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid OTP. {2 - current_resends} resend(s) remaining.",
+                    headers={"X-Requires-OTP": "true"},
+                )
+
+            # OTP correct — mark used, clear attempts, login
+            await conn.execute("UPDATE otps SET used=TRUE WHERE id=$1", otp_row["id"])
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                req.email,
+            )
+
+            # Build response for matched user
+            if matched_type == "user":
+                payload = {
+                    "sub": matched_row["id"], "role": matched_row["role"],
+                    "account_type": "user", "tenant_id": matched_row["tenant_id"],
+                    "plan": matched_row["plan"],
+                }
+                user_out = {
+                    "id": matched_row["id"], "name": matched_row["name"],
+                    "email": matched_row["email"], "role": matched_row["role"],
+                    "account_type": "user", "tenant_id": matched_row["tenant_id"],
+                    "plan": matched_row["plan"],
+                    "ticket_limit": matched_row["tenant_ticket_limit"],
+                    "logo_url": matched_row["logo_url"],
+                    "company": matched_row["company"],
+                    "tenant_status": matched_row["tenant_status"],
+                    "suspension_reason": matched_row.get("suspension_reason"),
+                    "domain_verified": matched_row.get("domain_verified", False),
+                }
+            else:
+                payload = {
+                    "sub": matched_row["id"], "role": matched_row["role"],
+                    "account_type": "admin",
+                }
+                user_out = {
+                    "id": matched_row["id"], "name": matched_row["name"],
+                    "email": matched_row["email"], "role": matched_row["role"],
+                    "account_type": "admin", "ticket_limit": matched_row["ticket_limit"],
+                }
+
+            await conn.execute(
+                f"UPDATE {'user_auth' if matched_type == 'user' else 'admin_users'}"
+                " SET last_active=NOW() WHERE id=$1", matched_row["id"]
+            )
+            session_hrs = await _get_session_hours()
+            return {
+                "access_token": _access_token(payload, session_hrs),
+                "user": user_out,
+            }
+
+        # ── Normal login flow (fail_count < 2) ─────────────────────────────
+
+        # Try tenant dashboard user (active OR suspended — both can login)
         row = await conn.fetchrow(
             "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit, t.logo_url, t.company,"
             " t.status AS tenant_status, t.suspension_reason, t.domain_verified"
             " FROM user_auth ua"
             " JOIN tenants t ON ua.tenant_id = t.id"
-            " WHERE ua.email = $1 AND ua.status IN ('active', 'suspended')",
+            " WHERE ua.email = $1 AND ua.status IN ('active','suspended')",
             req.email,
         )
-        if row and verify_password(req.password, row["password_hash"]):
+        if row and verify_password(password, row["password_hash"]):
+            # Success — clear failed attempts
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                req.email,
+            )
             payload = {
                 "sub":          row["id"],
                 "role":         row["role"],
@@ -272,14 +568,21 @@ async def login(req: LoginReq):
                 "UPDATE user_auth SET last_active=NOW() WHERE id=$1", row["id"]
             )
             session_hrs = await _get_session_hours()
-            return {"access_token": _access_token(payload, session_hrs), "user": user_out}
+            return {
+                "access_token": _access_token(payload, session_hrs),
+                "user": user_out,
+            }
 
         # Try admin / superadmin
         row = await conn.fetchrow(
             "SELECT * FROM admin_users WHERE email=$1 AND status='active'",
             req.email,
         )
-        if row and verify_password(req.password, row["password_hash"]):
+        if row and verify_password(password, row["password_hash"]):
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='login'",
+                req.email,
+            )
             payload = {
                 "sub":          row["id"],
                 "role":         row["role"],
@@ -297,9 +600,29 @@ async def login(req: LoginReq):
                 "UPDATE admin_users SET last_active=NOW() WHERE id=$1", row["id"]
             )
             session_hrs = await _get_session_hours()
-            return {"access_token": _access_token(payload, session_hrs), "user": user_out}
+            return {
+                "access_token": _access_token(payload, session_hrs),
+                "user": user_out,
+            }
 
-    raise HTTPException(status_code=401, detail="Invalid email or password")
+        # ── Failed login — record attempt ──────────────────────────────────
+        await conn.execute(
+            "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+            " VALUES ($1, $2, FALSE, 'login')",
+            req.email, client_ip,
+        )
+        new_fail_count = fail_count + 1
+
+        # Graduated response
+        headers = {}
+        if new_fail_count >= 2:
+            headers["X-Suggest-Forgot"] = "true"
+
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid email or password",
+        headers=headers if headers else None,
+    )
 
 
 @router.post("/logout")
@@ -396,7 +719,7 @@ async def register_request_otp(req: RegisterOTPReq, request: Request):
             "website":       req.website,
             "phone":         req.phone or "",
             "country_code":  req.country_code or "+91",
-            "password_hash": hash_password(req.password),
+            "password_hash": hash_password(decrypt_password(req.password)),
             "logo_url":      req.logo_url or "",
         })
 
@@ -491,8 +814,8 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
             await conn.execute(
                 "INSERT INTO tenants"
                 " (id,name,email,company,domain,logo_url,phone,country_code,plan,status,"
-                "  ticket_limit,widget_slug,widget_secret,domain_verified,suspension_reason)"
-                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'trial',$9,$10,$11,$12,$13,$14)",
+                "  ticket_limit,widget_slug,widget_secret,domain_verified,suspension_reason,terms_accepted)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'trial',$9,$10,$11,$12,$13,$14,TRUE)",
                 tid, name, req.email, c_name, website, logo_url,
                 phone, country_code, tenant_status, tlimit, w_slug, w_secret,
                 domain_verified, suspension_reason,
@@ -522,6 +845,18 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
                 "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
                 " ON CONFLICT (tenant_id) DO NOTHING", tid
             )
+
+            # Seed signup domain into tenant_domains (CORS whitelist)
+            if website:
+                signup_domain = website.split("://")[-1].split("/")[0].split(":")[0].lower()
+                signup_domain = signup_domain.replace("www.", "")
+                if signup_domain:
+                    await conn.execute(
+                        "INSERT INTO tenant_domains (id, tenant_id, domain, added_by, verified)"
+                        " VALUES ($1, $2, $3, 'system', $4)"
+                        " ON CONFLICT (tenant_id, domain) DO NOTHING",
+                        secrets.token_hex(8), tid, signup_domain, domain_verified,
+                    )
 
             uid = secrets.token_hex(8)
             await conn.execute(
@@ -568,12 +903,63 @@ async def register(req: RegisterReq, request: Request, bg_tasks: BackgroundTasks
 @router.post("/forgot-password")
 async def forgot_password(req: ForgotPwdReq, request: Request):
     """
-    Generate a password-reset token and (in production) send an email.
-    Returns the token in the response for development — strip this in prod.
+    Password reset request with graduated lockout:
+      - 30-day cooldown since last password change
+      - Attempt 1: send OTP, 2 resends, then lock for 6 hours
+      - Attempt 2 (after 6hr): send OTP, 2 resends, then SUSPEND account
     """
+    client_ip = request.client.host if request.client else "unknown"
     pool = await get_pool()
+
     async with pool.acquire() as conn:
-        # Check user_auth first, then admin_users
+        # ── 30-day cooldown check ──────────────────────────────────────────
+        pwd_changed = await conn.fetchval(
+            "SELECT password_changed_at FROM user_auth WHERE email=$1",
+            req.email,
+        )
+        if not pwd_changed:
+            pwd_changed = await conn.fetchval(
+                "SELECT updated_at FROM admin_users WHERE email=$1",
+                req.email,
+            )
+        if pwd_changed:
+            days_since = (datetime.now(timezone.utc) - pwd_changed).days
+            if days_since < 30:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Password can only be changed once every 30 days. "
+                           f"Try again in {30 - days_since} day(s).",
+                )
+
+        # ── Count forgot-password attempts (last 24 hours) ────────────────
+        attempts = await conn.fetch(
+            "SELECT created_at FROM login_attempts"
+            " WHERE email=$1 AND purpose='forgot_password'"
+            "   AND created_at >= NOW() - INTERVAL '24 hours'"
+            " ORDER BY created_at ASC",
+            req.email,
+        )
+        attempt_count = len(attempts)
+
+        if attempt_count >= 2:
+            # Check if 2nd attempt was also exhausted → SUSPEND
+            raise HTTPException(
+                status_code=403,
+                detail="Account suspended. Too many password reset attempts. Contact administrator.",
+            )
+
+        if attempt_count == 1:
+            # Check 6-hour lockout from first attempt
+            first_attempt_time = attempts[0]["created_at"]
+            hours_elapsed = (datetime.now(timezone.utc) - first_attempt_time).total_seconds() / 3600
+            if hours_elapsed < 6:
+                remaining_hrs = int(6 - hours_elapsed) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Password reset locked. Try again in ~{remaining_hrs} hour(s).",
+                )
+
+        # ── Look up user ───────────────────────────────────────────────────
         user_row = await conn.fetchrow(
             "SELECT id,'user' AS utype FROM user_auth WHERE email=$1 AND status='active'",
             req.email,
@@ -584,8 +970,20 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
                 req.email,
             )
         if not user_row:
-            # Don't reveal whether the email exists
+            # Don't reveal whether the email exists — but still record
+            await conn.execute(
+                "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+                " VALUES ($1, $2, FALSE, 'forgot_password')",
+                req.email, client_ip,
+            )
             return {"message": "If that email is registered, a reset link has been sent."}
+
+        # ── Record attempt ─────────────────────────────────────────────────
+        await conn.execute(
+            "INSERT INTO login_attempts (email, ip_address, success, purpose)"
+            " VALUES ($1, $2, FALSE, 'forgot_password')",
+            req.email, client_ip,
+        )
 
         # Invalidate any existing unused tokens for this user
         await conn.execute(
@@ -597,7 +995,7 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
         # Generate 6-digit numeric OTP
         otp = "".join(secrets.choice("0123456789") for _ in range(6))
         token_hash = hashlib.sha256(otp.encode()).hexdigest()
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15) # OTPs expire faster (15 mins)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
 
         await conn.execute(
             "INSERT INTO password_reset_tokens"
@@ -613,13 +1011,12 @@ async def forgot_password(req: ForgotPwdReq, request: Request):
             expires_at,
         )
 
-        await conn.execute(...)
-
     # Send real email with OTP
     await request.app.state.leads.send_otp_email(req.email, otp, "Password Reset")
     logger.info(f"[DEV] OTP for {req.email}: {otp}")
     return {
         "message": "OTP sent (check email)",
+        "attempt": attempt_count + 1,
     }
 
 
@@ -638,18 +1035,28 @@ async def reset_password(req: ResetPwdReq, request: Request):
         if not row:
             raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
-        new_hash = hash_password(req.new_password)
+        new_hash = hash_password(decrypt_password(req.new_password))
         tbl      = "user_auth" if row["user_type"] == "user" else "admin_users"
         await conn.execute(
-            f"UPDATE {tbl} SET password_hash=$1, updated_at=NOW() WHERE id=$2",
+            f"UPDATE {tbl} SET password_hash=$1, password_changed_at=NOW(),"
+            " updated_at=NOW() WHERE id=$2",
             new_hash, row["user_id"],
         )
         await conn.execute(
             "UPDATE password_reset_tokens SET used=TRUE WHERE id=$1", row["id"]
         )
+        # Clear forgot-password lockout attempts on success
+        user_email = await conn.fetchval(
+            f"SELECT email FROM {tbl} WHERE id=$1", row["user_id"]
+        )
+        if user_email:
+            await conn.execute(
+                "DELETE FROM login_attempts WHERE email=$1 AND purpose='forgot_password'",
+                user_email,
+            )
 
         # Send security alert
-        await request.app.state.leads.send_security_alert(row.get("email") or "User", "Password Reset")
+        await request.app.state.leads.send_security_alert(user_email or "User", "Password Reset")
 
     return {"message": "Password updated successfully"}
 
@@ -669,7 +1076,7 @@ async def request_password_change_otp(
         row = await conn.fetchrow(
             f"SELECT password_hash, email FROM {tbl} WHERE id=$1", current["id"]
         )
-        if not row or not verify_password(req.current_password, row["password_hash"]):
+        if not row or not verify_password(decrypt_password(req.current_password), row["password_hash"]):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
 
         # Generate 6-digit OTP
@@ -685,7 +1092,11 @@ async def request_password_change_otp(
             token_hash, expires_at
         )
 
-        await conn.execute(...)
+        await conn.execute(
+            "UPDATE password_reset_tokens SET used=TRUE"
+            " WHERE user_id=$1 AND used=FALSE",
+            current["id"],
+        )
 
     # Send email
     await request.app.state.leads.send_otp_email(row['email'], otp, "Password Change")
@@ -718,13 +1129,14 @@ async def change_password(
         row = await conn.fetchrow(
             f"SELECT password_hash FROM {tbl} WHERE id=$1", current["id"]
         )
-        if not row or not verify_password(req.current_password, row["password_hash"]):
+        if not row or not verify_password(decrypt_password(req.current_password), row["password_hash"]):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
 
         # Update password
         await conn.execute(
-            f"UPDATE {tbl} SET password_hash=$1, updated_at=NOW() WHERE id=$2",
-            hash_password(req.new_password), current["id"],
+            f"UPDATE {tbl} SET password_hash=$1, password_changed_at=NOW(),"
+            " updated_at=NOW() WHERE id=$2",
+            hash_password(decrypt_password(req.new_password)), current["id"],
         )
         
         # Mark OTP as used
@@ -738,3 +1150,74 @@ async def change_password(
         await _audit(conn, current, "change_password", "user", current["id"], {}, tenant_id=current.get("tenant_id"))
 
     return {"message": "Password changed successfully"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LOCKED ACCOUNT TICKET  (unauthenticated — only for locked tenant users)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class LockedTicketReq(BaseModel):
+    email: str
+    context: str = ""
+
+
+@router.post("/locked-ticket", status_code=201)
+async def locked_ticket(req: LockedTicketReq):
+    """
+    Unauthenticated endpoint for LOCKED tenant users to raise a support ticket.
+    Only works when the user_auth row for the email has status='locked'.
+    Limited to 1 open locked-ticket per email to prevent abuse.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 1. Verify user exists and is locked
+        row = await conn.fetchrow(
+            "SELECT ua.id, ua.tenant_id, ua.name FROM user_auth ua"
+            " WHERE ua.email=$1 AND ua.status='locked'",
+            req.email,
+        )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="No locked account found for this email.",
+            )
+
+        user_id   = row["id"]
+        tenant_id = row["tenant_id"]
+        user_name = row["name"]
+
+        # 2. Rate limit: max 1 open locked-ticket per email
+        existing = await conn.fetchval(
+            "SELECT COUNT(*) FROM tickets"
+            " WHERE user_id=$1 AND type='locked_account'"
+            "   AND status IN ('open','claimed')",
+            user_id,
+        )
+        if existing and existing > 0:
+            raise HTTPException(
+                status_code=429,
+                detail="A support ticket for this account is already open. Our team will contact you shortly.",
+            )
+
+        # 3. Create the ticket
+        tid = secrets.token_hex(10)
+        heading = "Account Locked — Login Issue"
+        context = req.context.strip() if req.context else "User account was locked due to multiple failed login attempts."
+
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO tickets (id,tenant_id,user_id,heading,context,type,priority)"
+                " VALUES ($1,$2,$3,$4,$5,'locked_account','high')",
+                tid, tenant_id, user_id, heading, context,
+            )
+            await conn.execute(
+                "INSERT INTO ticket_status_log"
+                " (ticket_id,changed_by,changer_role,from_status,to_status,note)"
+                " VALUES ($1,$2,'user','none','open','Auto-created: locked account')",
+                tid, user_id,
+            )
+
+    return {
+        "ticket_id": tid,
+        "message": f"Support ticket created successfully. Our team will review your account and contact you at {req.email}.",
+    }

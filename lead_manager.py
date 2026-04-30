@@ -121,7 +121,7 @@ class LeadManager:
             to=recipient,
             subject=(
                 f"\U0001f525 New Lead — {intent.get('lead_quality','warm').upper()} | "
-                f"{tenant.get('name','Winssoft BMA')}"
+                f"{tenant.get('name','LeadsAI')}"
             ),
             html=html,
         )

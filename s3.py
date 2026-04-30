@@ -116,10 +116,6 @@ class S3StorageService(StorageService):
         import boto3
         self._bucket = os.getenv("S3_BUCKET", "winssoft-bma")
         self._region = os.getenv("S3_REGION", "ap-south-1")
-        self._cdn_url = os.getenv("S3_CDN_URL", "").rstrip("/")
-        # Ensure CDN URL has https:// scheme
-        if self._cdn_url and not self._cdn_url.startswith(("http://", "https://")):
-            self._cdn_url = f"https://{self._cdn_url}"
 
         self._client = boto3.client(
             "s3",
@@ -198,7 +194,7 @@ class S3StorageService(StorageService):
         # Full URLs pass through
         if stored_value.startswith(("http://", "https://", "data:")):
             return stored_value
-        api_url = os.getenv("VITE_API_URL", "").rstrip("/")
+        api_url = os.getenv("API_BASE_URL", "").rstrip("/")
         # Legacy /uploads/ path — convert to key
         if stored_value.startswith("/uploads/"):
             key = stored_value.replace("/uploads/", "", 1)
@@ -223,4 +219,3 @@ def create_storage_service() -> StorageService:
         raise RuntimeError("S3_ACCESS_KEY or S3_SECRET_KEY is missing. Local storage fallback is disabled.")
 
     return S3StorageService()
-""", "Description": "New storage service module with S3 and local disk dual-mode support, image validation, and presigned URL generation", "IsArtifact": false, "Overwrite": true, "TargetFile": "d:\\Somesh\\PROJECTS\\OmniChat\\backend\\s3.py"""

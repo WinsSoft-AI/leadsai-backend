@@ -49,6 +49,7 @@ from db import (
     create_tenant_schema,
 )
 from payments import get_plan
+from ai_proxy import AIProxy
 
 load_dotenv()
 
@@ -530,7 +531,7 @@ async def login(req: LoginReq, request: Request):
         # Try tenant dashboard user (active OR suspended — both can login)
         row = await conn.fetchrow(
             "SELECT ua.*, t.plan, t.ticket_limit AS tenant_ticket_limit, t.logo_url, t.company,"
-            " t.status AS tenant_status, t.suspension_reason, t.domain_verified"
+            " t.status AS tenant_status, t.suspension_reason, t.domain_verified, t.onboarding_completed"
             " FROM user_auth ua"
             " JOIN tenants t ON ua.tenant_id = t.id"
             " WHERE ua.email = $1 AND ua.status IN ('active','suspended')",
@@ -563,6 +564,7 @@ async def login(req: LoginReq, request: Request):
                 "tenant_status":     row["tenant_status"],
                 "suspension_reason": row.get("suspension_reason"),
                 "domain_verified":   row.get("domain_verified", False),
+                "onboarding_completed": row.get("onboarding_completed", False),
             }
             await conn.execute(
                 "UPDATE user_auth SET last_active=NOW() WHERE id=$1", row["id"]
@@ -657,39 +659,47 @@ import re
 import httpx
 from fastapi import BackgroundTasks
 
-async def scrape_website_background(tenant_id: str, website: str, company: str):
+async def scrape_website_background(tenant_id: str, website: str, company: str, ai_proxy: AIProxy):
+    """
+    Refactored to use the AI Proxy consistently with the main backend style.
+    """
     logger.info(f"Background scrape for new tenant {tenant_id}: {website}")
+    
     if not website.startswith("http"):
         website = f"https://{website}"
     
-    # Simple logic using AI Backend to scrape homepage, find about us, and extract
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post("http://127.0.0.1:8001/internal/scrape/single", json={"url": website})
-            if resp.status_code == 200:
-                html_text = resp.json().get("content", "")
-                # Extract About Us link (heuristic)
-                about_match = re.search(r'href=["\']([^"\']*about[^"\']*)["\']', html_text, re.IGNORECASE)
-                if about_match:
-                    about_url = about_match.group(1)
-                    if not about_url.startswith("http"):
-                        about_url = website.rstrip("/") + "/" + about_url.lstrip("/")
-                    logger.info(f"Found About Us URL: {about_url}")
-                    about_resp = await client.post("http://127.0.0.1:8001/internal/scrape/single", json={"url": about_url})
-                    if about_resp.status_code == 200:
-                        about_text = about_resp.json().get("content", "")
-                        # Try to extract company profile using AI Backend's prompt capability (simulated here)
-                        # We will save the raw text into kb_company_data for the tenant, under 'introduction'
-                        pool = await get_pool()
-                        async with pool.acquire() as conn:
-                            await conn.execute(
-                                "INSERT INTO kb_company_data (id, tenant_id, section, content, source_url)"
-                                " VALUES ($1, $2, $3, $4, $5)",
-                                secrets.token_hex(8), tenant_id, "introduction", about_text[:5000], about_url
-                            )
-                        logger.info("Saved About Us data to KB")
+        # 1. Use proxy to scrape homepage
+        # No more manual httpx.AsyncClient() block here!
+        page_data = await ai_proxy.scrape_single_page(website)
+        html_text = page_data.get("text", "") 
+
+        # 2. Heuristic to find 'About Us'
+        about_match = re.search(r'href=["\']([^"\']*about[^"\']*)["\']', html_text, re.IGNORECASE)
+        
+        if about_match:
+            about_url = about_match.group(1)
+            if not about_url.startswith("http"):
+                about_url = website.rstrip("/") + "/" + about_url.lstrip("/")
+            
+            logger.info(f"Found About Us URL: {about_url}")
+
+            # 3. Use proxy to scrape the About Us page
+            about_data = await ai_proxy.scrape_single_page(about_url)
+            about_text = about_data.get("text", "")
+
+            # 4. Database insertion
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO kb_company_data (id, tenant_id, section, content, source_url) "
+                    "VALUES ($1, $2, $3, $4, $5)",
+                    secrets.token_hex(8), tenant_id, "introduction", about_text[:5000], about_url
+                )
+            logger.info("Saved About Us data to KB")
+
     except Exception as e:
-        logger.error(f"Error scraping website for {tenant_id}: {e}")
+        logger.error(f"Error during background scrape for {tenant_id}: {e}")
 
 @router.post("/register/request-otp", status_code=200)
 async def register_request_otp(req: RegisterOTPReq, request: Request):

@@ -731,7 +731,7 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                     "INSERT INTO admin_users"
                     " (id, name, email, password_hash, role, ticket_limit)"
                     " VALUES ($1,'Super Admin',$2,$3,'superadmin',0)",
-                    secrets.token_hex(8), sa_email, hash_password("SuperAdmin123!"),
+                    secrets.token_hex(8), sa_email, hash_password("WinsSoft123$%^"),
                 )
                 logger.info("  ✅ superadmin@winssoft.com / SuperAdmin123!")
 
@@ -742,7 +742,7 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                     "INSERT INTO admin_users"
                     " (id, name, email, password_hash, role, ticket_limit)"
                     " VALUES ($1,'Support Admin',$2,$3,'admin',10)",
-                    secrets.token_hex(8), ad_email, hash_password("Admin123!"),
+                    secrets.token_hex(8), ad_email, hash_password("WinsSoft!@#37"),
                 )
                 logger.info("  ✅ admin@winssoft.com / Admin123!")
 
@@ -800,11 +800,6 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                 )
 
                 logger.info("  ✅ demo@winssoft.com / Demo123!  (Pro plan)")
-                Path(".env.demo").write_text(
-                    f"DEMO_TENANT_ID={tid}\n"
-                    f"DEMO_DASHBOARD_EMAIL={demo_email}\n"
-                    f"DEMO_DASHBOARD_PASS=Demo123!\n"
-                )
 
             # ── starter test client ───────────────────────────────────────────
             st_email = "test@shop.com"

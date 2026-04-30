@@ -153,8 +153,9 @@ import asyncpg
 from dotenv import load_dotenv
 from fastapi import (
     Body, Depends, Request, FastAPI, File, Form, Header, HTTPException,
-    Query, UploadFile, WebSocket, WebSocketDisconnect, status, BackgroundTasks
+    Query, UploadFile, WebSocket, WebSocketDisconnect, status, BackgroundTasks, Response
 )
+from starlette.datastructures import MutableHeaders
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
@@ -187,8 +188,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-WIDGET_DIR = Path("widget")
-WIDGET_DIR.mkdir(parents=True, exist_ok=True)
+WIDGET_DIR = Path(__file__).parent / "widget"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 PRODUCT_UPLOAD_DIR = UPLOAD_DIR / "products"
 PRODUCT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -283,18 +283,77 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    # Load allowed origins from .env
+env_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+allowed_origins = [o.strip() for o in env_origins if o.strip()]
+
+class DynamicCORSMiddleware:
+    def __init__(self, app, static_origins: list[str]):
+        self.app = app
+        self.static_origins = static_origins
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        request = Request(scope, receive=receive)
+        origin = request.headers.get("origin")
+
+        # 1. Check static origins (dashboard, dev)
+        is_allowed = False
+        if not origin:
+            is_allowed = True # direct calls
+        elif "*" in self.static_origins or origin in self.static_origins:
+            is_allowed = True
+        
+        # 2. Dynamic check for widget domains
+        if not is_allowed and origin:
+            clean_origin = origin.split("://")[-1].split(":")[0].lower()
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                # Check both public.tenants (legacy) and public.tenant_domains
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM tenant_domains WHERE domain=$1 AND verified=TRUE "
+                    "UNION "
+                    "SELECT 1 FROM tenants WHERE domain=$1",
+                    clean_origin
+                )
+                if exists:
+                    is_allowed = True
+
+        if request.method == "OPTIONS":
+            response = Response(status_code=204)
+            if is_allowed:
+                response.headers["Access-Control-Allow-Origin"] = origin or "*"
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+                response.headers["Access-Control-Allow-Headers"] = "*"
+                response.headers["Access-Control-Expose-Headers"] = "*"
+            return await response(scope, receive, send)
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                if is_allowed:
+                    headers["Access-Control-Allow-Origin"] = origin or "*"
+                    headers["Access-Control-Allow-Credentials"] = "true"
+                    # Add standard CORS headers for non-OPTIONS responses too
+                    if "Access-Control-Allow-Methods" not in headers:
+                        headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+                    if "Access-Control-Allow-Headers" not in headers:
+                        headers["Access-Control-Allow-Headers"] = "*"
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+app.add_middleware(DynamicCORSMiddleware, static_origins=allowed_origins)
+
 
 app.include_router(auth_router)
 if os.getenv("DEV_MODE", "false").lower() == "true":
     app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
-app.mount("/widget", StaticFiles(directory=str(WIDGET_DIR)), name="widget")
+if WIDGET_DIR.exists():
+    app.mount("/widget", StaticFiles(directory=str(WIDGET_DIR)), name="widget")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TOKEN METERING HELPER
@@ -546,6 +605,10 @@ async def _get_tenant_config(tenant_id: str) -> Dict:
         if not row:
             raise HTTPException(status_code=403, detail="Account activation issue. Please contact support.")
             
+        # Resolve S3 keys to presigned URLs for the widget
+        logo = app.state.s3.resolve_url(row.get("logo_url")) if row.get("logo_url") else None
+        bg   = app.state.s3.resolve_url(row.get("bg_image_url")) if row.get("bg_image_url") else None
+
         return {
             "id":                 row["tenant_id"],
             "name":               row["name"],
@@ -557,7 +620,7 @@ async def _get_tenant_config(tenant_id: str) -> Dict:
             "accent_color":       row["accent_color"]       or "#00d4f5",
             "secondary_color":    row["secondary_color"]    or "#ffffff",
             "text_color":         row["text_color"]         or "#000000",
-            "bg_image_url":       row["bg_image_url"],
+            "bg_image_url":       bg,
             "proactive_enabled":  bool(row["proactive_enabled"]),
             "tts_enabled":        bool(row["tts_enabled"]),
             "stt_enabled":        bool(row["stt_enabled"]),
@@ -565,10 +628,10 @@ async def _get_tenant_config(tenant_id: str) -> Dict:
             "notification_email": row["notification_email"] or row["email"],
             "languages":          row["languages"]          or "en",
             "pii_after_messages": row["pii_after_messages"] or 3,
-            "logo_url":           row.get("logo_url"),
+            "logo_url":           logo,
             "bot_text_color":     row.get("bot_text_color") or "#ffffff",
             "user_text_color":    row.get("user_text_color") or "#ffffff",
-            "widget_name":        row.get("widget_name"),
+            "business_name":      row.get("widget_name") or row["name"],
             "position":           row.get("position") or "bottom-right",
             "proactive_delay_s":  row.get("proactive_delay_s") or 5,
             "proactive_message":  row.get("proactive_message") or "Hi there! Need help? Chat with us!",
@@ -967,7 +1030,7 @@ async def _capture_session_metadata(
 
 @app.post("/v1/chat", response_model=ChatResponse, tags=["Widget"])
 async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, tenant=Depends(verify_widget_jwt)):
-    session        = await app.state.sessions.get_or_create(req.session_id, tenant["id"])
+    session = await app.state.sessions.get_or_create(req.session_id, tenant["id"])
 
     # Capture metadata on first message (non-blocking background task)
     if session.get("message_count", 0) == 0:
@@ -990,8 +1053,8 @@ async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, te
         return ChatResponse(session_id=session["id"], message=fast_reply, sources=[])
 
     context_chunks = await app.state.ai.rag_retrieve(query=req.message, tenant_id=tenant["id"], top_k=8)
-    history        = session.get("history", [])
-    result         = await app.state.ai.gemini_chat(
+    history = session.get("history", [])
+    result = await app.state.ai.gemini_chat(
         message=req.message, history=history,
         context_chunks=context_chunks, tenant_config=tenant, language=req.language,
     )
@@ -1027,7 +1090,7 @@ async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, te
             if isinstance(c, dict) and str(c.get("source", "")).startswith("Product")
         ]
         if product_sources and not is_fallback:
-            async with tenant_conn(tenant_id) as conn:
+            async with tenant_conn(tenant["id"]) as conn:
                 for src in product_sources[:4]:
                     src_name = str(src.get("source", ""))
                     prod_name = src_name.replace("Product - ", "").replace("Product -", "").strip()
@@ -1060,7 +1123,7 @@ async def chat(req: ChatRequest, request: Request, bg_tasks: BackgroundTasks, te
     # ── Persist session to DB (incremental upsert) ──
     try:
         visitor_id = req.session_id.split("_")[0] if "_" in req.session_id else "visitor"
-        async with tenant_conn(tenant_id) as conn:
+        async with tenant_conn(tenant["id"]) as conn:
             await conn.execute(
                 "INSERT INTO sessions (id, tenant_id, visitor_id, language, message_count, "
                 "pii_collected, chat_history, last_active) "
@@ -1096,7 +1159,7 @@ async def chat_test(req: _TestChatReq, current: dict = Depends(get_current_user)
     tid = current["tenant_id"]
 
     # Load tenant config for Gemini prompt context
-    async with tenant_conn(tenant_id) as conn:
+    async with tenant_conn(tid) as conn:
         tenant_row = await conn.fetchrow(
             "SELECT t.*, wc.greeting, wc.primary_color, wc.name AS widget_name "
             "FROM tenants t LEFT JOIN widget_configs wc ON wc.tenant_id = t.id "
@@ -1179,7 +1242,7 @@ async def capture_lead(lead: LeadCapture, tenant=Depends(verify_widget_jwt)):
     # Persist PII flag to DB session row
     try:
         visitor_id = lead.session_id.split("_")[0] if "_" in lead.session_id else "visitor"
-        async with tenant_conn(tenant_id) as conn:
+        async with tenant_conn(tenant["id"]) as conn:
             await conn.execute(
                 "INSERT INTO sessions (id, tenant_id, visitor_id, pii_collected, last_active) "
                 "VALUES ($1, $2, $3, TRUE, NOW()) "
@@ -1214,7 +1277,7 @@ async def _process_closed_session(session_id: str, session: dict, tenant: dict, 
     # 2. Persist full session to DB
     try:
         visitor_id = session_id.split("_")[0] if "_" in session_id else "visitor"
-        async with tenant_conn(tenant_id) as conn:
+        async with tenant_conn(tenant["id"]) as conn:
             async with conn.transaction():
                 await conn.execute(
                     "INSERT INTO sessions (id, tenant_id, visitor_id, language, message_count, "
@@ -1329,7 +1392,7 @@ async def _process_closed_session(session_id: str, session: dict, tenant: dict, 
     try:
         visitor_name = pii.get("name", "").strip() if pii else ""
         if visitor_name:
-            async with tenant_conn(tenant_id) as conn:
+            async with tenant_conn(tenant["id"]) as conn:
                 await conn.execute(
                     "UPDATE session_metadata SET visitor_name=$1 WHERE session_id=$2",
                     visitor_name, session_id,
@@ -1617,6 +1680,31 @@ async def get_analytics(
     named_l = leads_row["named_leads"]  if leads_row else 0
     total_i = sum(r["cnt"] for r in intents) or 1
 
+    # Zero-padding for the date range to ensure charts show a continuous line
+    sessions_by_day = []
+    daily_map = {r["day"]: dict(r) for r in daily}
+    
+    current_date = start_dt.date()
+    target_end = end_dt.date()
+    
+    while current_date <= target_end:
+        day_str = current_date
+        if day_str in daily_map:
+            sessions_by_day.append(daily_map[day_str])
+        else:
+            sessions_by_day.append({
+                "day": day_str,
+                "sessions": 0,
+                "leads": 0,
+                "hot_leads": 0,
+                "warm_leads": 0,
+                "cold_leads": 0,
+                "positive_sent": 0,
+                "neutral_sent": 0,
+                "negative_sent": 0
+            })
+        current_date += timedelta(days=1)
+
     return {
         "store_name":        (tenant_row["company"] if tenant_row else "") or "",
         "total_sessions":    total_s,
@@ -1628,7 +1716,7 @@ async def get_analytics(
         "leads_change":      0,
         "hot_change":        0,
         "conversion_change": 0,
-        "sessions_by_day":   [dict(r) for r in daily],
+        "sessions_by_day":   sessions_by_day,
         "top_intents":       [{"intent": r["intent"],
                                "pct": round(r["cnt"] / total_i * 100)} for r in intents],
         "language_breakdown":{r["language"]: r["cnt"] for r in langs},
@@ -2171,17 +2259,13 @@ async def kb_scrape_product_url(
         "product": enriched,
     }
 
-@app.post("/v1/kb/sync", tags=["Dashboard"])
-async def kb_sync_vectors(current: dict = Depends(get_current_user)):
-    """Trigger a vector DB rebuild for the tenant's structured KB data."""
-    _must_be_owner_or_member(current)
-    tid = current["tenant_id"]
-
+async def _rebuild_tenant_vectors(tid: str):
+    """Helper to trigger a vector DB rebuild for a tenant's structured KB data."""
     import hashlib
     chunks = []
 
-    async with tenant_conn(current["tenant_id"]) as conn:
-        # 1. Company data → one chunk per section
+    async with tenant_conn(tid) as conn:
+        # 1. Company data
         company_rows = await conn.fetch(
             "SELECT section, field_key, field_value FROM kb_company_data "
             "WHERE tenant_id=$1 ORDER BY section, display_order", tid,
@@ -2200,7 +2284,7 @@ async def kb_sync_vectors(current: dict = Depends(get_current_user)):
                 chunk_id = f"kb_company_{hashlib.md5(f'{tid}:{sec_name}'.encode()).hexdigest()[:12]}"
                 chunks.append({"id": chunk_id, "text": text, "source": f"Company Data - {sec_name.replace('_', ' ').title()}", "chunk_index": 0, "word_count": len(text.split())})
 
-        # 2. Products → one chunk per product
+        # 2. Products
         products = await conn.fetch(
             "SELECT * FROM kb_products WHERE tenant_id=$1 ORDER BY category, name", tid,
         )
@@ -2214,7 +2298,7 @@ async def kb_sync_vectors(current: dict = Depends(get_current_user)):
             text = "\n".join(parts)
             chunks.append({"id": f"kb_product_{prod['id']}", "text": text, "source": f"Product - {prod['name']}", "chunk_index": 0, "word_count": len(text.split())})
 
-        # 3. Custom Q/A → one chunk per Q/A pair
+        # 3. Custom Q/A
         qas = await conn.fetch(
             "SELECT id, question, answer FROM knowledge_qa WHERE tenant_id=$1", tid,
         )
@@ -2223,8 +2307,14 @@ async def kb_sync_vectors(current: dict = Depends(get_current_user)):
             chunks.append({"id": f"qa_{qa['id']}", "text": text, "source": "Custom Q/A", "chunk_index": 0, "word_count": len(text.split())})
 
     # Rebuild via AI_Backend
+    return await app.state.ai.rag_rebuild_structured(tenant_id=tid, chunks=chunks)
+
+@app.post("/v1/kb/sync", tags=["Dashboard"])
+async def kb_sync_vectors(current: dict = Depends(get_current_user)):
+    """Trigger a vector DB rebuild for the tenant's structured KB data."""
+    _must_be_owner_or_member(current)
     try:
-        result = await app.state.ai.rag_rebuild_structured(tenant_id=tid, chunks=chunks)
+        result = await _rebuild_tenant_vectors(current["tenant_id"])
         return {"status": "synced", **result}
     except Exception as e:
         raise HTTPException(502, f"Vector sync failed: {e}")
@@ -2429,38 +2519,25 @@ async def get_widget_embed(request: Request, current: dict = Depends(get_current
 
     cfg  = dict(cfg)
 
-    # Derive the CDN base URL from env — falls back to actual request origin for dev
-    cdn_base = os.getenv("WIDGET_CDN_URL", "").rstrip("/")
-    if not cdn_base:
-        cdn_base = str(request.base_url).rstrip("/") + "/widget"
-
-    api_base_url = str(request.base_url).rstrip("/")
-    fallback_base = api_base_url + "/widget"
+    # Derive the widget base URL from the current request origin
+    base_url = str(request.base_url).rstrip("/")
+    api_base_url = os.getenv("API_BASE_URL", base_url)
     
-    if cdn_base and cdn_base != fallback_base:
-        # Use CDN with a robust fallback script if the CDN fails
-        domain_snippet = (
-            f"<!-- Leads AI Widget -->\n"
-            f"<script\n"
-            f'  src="{cdn_base}/leadsai.js"\n'
-            f'  data-company="{cfg["widget_slug"]}"\n'
-            f'  data-api-base="{api_base_url}"\n'
-            f'  id="leadsai-embed-script"\n'
-            f"  defer\n"
-            f"  onerror=\"this.onerror=null;var s=document.createElement('script');s.src='{fallback_base}/leadsai.js';s.setAttribute('data-company','{cfg['widget_slug']}');s.setAttribute('data-api-base','{api_base_url}');s.defer=true;document.body.appendChild(s);\"\n"
-            f"></script>"
-        )
-    else:
-        domain_snippet = (
-            f"<!-- Leads AI Widget -->\n"
-            f"<script\n"
-            f'  src="{fallback_base}/leadsai.js"\n'
-            f'  data-company="{cfg["widget_slug"]}"\n'
-            f'  data-api-base="{api_base_url}"\n'
-            f'  id="leadsai-embed-script"\n'
-            f"  defer\n"
-            f"></script>"
-        )
+    import base64
+    api_key_b64 = base64.b64encode(api_base_url.encode()).decode()
+    
+    script_url = f"{base_url}/widget/leadsai.js"
+    
+    domain_snippet = (
+        f"<!-- Leads AI Widget -->\n"
+        f"<script\n"
+        f'  src="{script_url}"\n'
+        f'  data-company="{cfg["widget_slug"]}"\n'
+        f'  data-key="{api_key_b64}"\n'
+        f'  id="leadsai-embed-script"\n'
+        f"  defer\n"
+        f"></script>"
+    )
     snippets = [{
         "domain":  "Global Snippet",
         "label":   "Universal Embed snippet",
@@ -2471,8 +2548,8 @@ async def get_widget_embed(request: Request, current: dict = Depends(get_current
         "step_1": "Copy the embed snippet below.",
         "step_2": "Paste the <script> tag just before the closing </body> tag on your website.",
         "note":   "The widget authenticates automatically using the data-company attribute.",
-        "cdn_base":       cdn_base,
-        "docs_url":       "https://docs.leadsai.winssoft.com/widget/installation",
+        "cdn_base": script_url,
+        "docs_url": "https://docs.leadsai.winssoft.com/widget/installation",
     }
 
     return {
@@ -2506,7 +2583,13 @@ async def complete_onboarding(current: dict = Depends(get_current_user)):
         await conn.execute("UPDATE tenants SET onboarding_completed=TRUE WHERE id=$1", tid)
         await _audit(conn, current, "update", "tenants", tid, {"onboarding_completed": True})
     
-    return {"message": "Onboarding completed successfully"}
+    # Trigger Vector Sync in background (or await if you want to be sure)
+    try:
+        await _rebuild_tenant_vectors(tid)
+    except Exception as e:
+        logger.error(f"Vector sync failed during onboarding completion for {tid}: {e}")
+    
+    return {"message": "Onboarding completed successfully and Vector Sync Completed"}
 
 # ── Usage / subscription / payments ───────────────────────────────────────────
 @app.get("/v1/usage", tags=["Dashboard"])
@@ -2541,7 +2624,7 @@ class _VerifyReq(BaseModel):
     plan:                str
 
 @app.post("/v1/payment/create-order", tags=["Payments"])
-async def create_order(req: _OrderReq):
+async def create_order(req: _OrderReq, current: dict = Depends(get_current_user)):
     cfg = await get_plan(req.plan)
     if not cfg:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {req.plan}")
@@ -2600,7 +2683,7 @@ async def tenant_audit_log(current: dict = Depends(get_current_user)):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT created_at, action, entity_type, entity_id, meta,"
-            " actor_id, actor_role, ip_address"
+            " actor_id, actor_role"
             " FROM audit_log WHERE tenant_id=$1"
             " ORDER BY created_at DESC LIMIT 200",
             current["tenant_id"]
@@ -4322,12 +4405,12 @@ async def admin_resolve_ticket(
     pool = await get_pool()
     async with pool.acquire() as conn:
         ticket = await conn.fetchrow(
-            "SELECT status, claimed_by FROM tickets WHERE id=$1", ticket_id
+            "SELECT status, claimed_by, tenant_id FROM tickets WHERE id=$1", ticket_id
         )
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found")
-        if ticket["claimed_by"] != current["id"]:
-            raise HTTPException(status_code=403, detail="Only the claiming admin can resolve")
+        if ticket["claimed_by"] != current["id"] and current["role"] != "superadmin":
+            raise HTTPException(status_code=403, detail="Only the claiming admin or superadmin can resolve")
         if ticket["status"] != "claimed":
             raise HTTPException(status_code=400, detail="Ticket must be 'claimed' to resolve")
         async with conn.transaction():
@@ -4338,8 +4421,8 @@ async def admin_resolve_ticket(
             await conn.execute(
                 "INSERT INTO ticket_status_log"
                 " (ticket_id,changed_by,changer_role,from_status,to_status,note)"
-                " VALUES ($1,$2,'admin','claimed','solved',$3)",
-                ticket_id, current["id"], body.note,
+                " VALUES ($1,$2,$3,$4,'solved',$5)",
+                ticket_id, current["id"], current["role"], ticket["status"], body.note,
             )
             await _audit(conn, current, "resolve_ticket", "ticket", ticket_id,
                          {"note": body.note[:100]}, tenant_id=ticket["tenant_id"])
@@ -4370,6 +4453,15 @@ async def admin_assign_ticket(
         raise HTTPException(status_code=400, detail="admin_id required")
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Fetch current ticket state
+        ticket = await conn.fetchrow(
+            "SELECT status, claimed_by, tenant_id FROM tickets WHERE id=$1", ticket_id
+        )
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        if ticket["claimed_by"] == admin_id:
+            raise HTTPException(status_code=400, detail="Ticket is already assigned to this admin")
+
         target = await conn.fetchrow(
             "SELECT ticket_limit,"
             " (SELECT COUNT(*) FROM tickets WHERE claimed_by=admin_users.id"
@@ -4385,20 +4477,22 @@ async def admin_assign_ticket(
             limit = int(limit or 10)
         if target["open"] >= limit:
             raise HTTPException(status_code=400, detail="Target admin has reached their limit")
-        await conn.execute(
-            "UPDATE tickets SET assigned_to=$1, claimed_by=$1, status='claimed',"
-            " updated_at=NOW() WHERE id=$2",
-            admin_id, ticket_id,
-        )
-        await conn.execute(
-            "INSERT INTO ticket_status_log"
-            " (ticket_id,changed_by,changer_role,from_status,to_status,note)"
-            " VALUES ($1,$2,'superadmin','open','claimed','Assigned by superadmin')",
-            ticket_id, current["id"],
-        )
-        await _audit(conn, current, "assign_ticket", "ticket", ticket_id,
-                     {"admin_id": admin_id})
-    return {"status": "assigned", "admin_id": admin_id}
+        
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE tickets SET assigned_to=$1, claimed_by=$1, status='claimed',"
+                " updated_at=NOW() WHERE id=$2",
+                admin_id, ticket_id,
+            )
+            await conn.execute(
+                "INSERT INTO ticket_status_log"
+                " (ticket_id,changed_by,changer_role,from_status,to_status,note)"
+                " VALUES ($1,$2,'superadmin',$3,'claimed','Assigned by superadmin')",
+                ticket_id, current["id"], ticket["status"],
+            )
+            await _audit(conn, current, "assign_ticket", "ticket", ticket_id,
+                         {"assigned_to": admin_id}, tenant_id=ticket["tenant_id"])
+    return {"status": "assigned"}
 
 @app.get("/admin/analytics", tags=["Admin"])
 async def admin_analytics(days: int = 30, current: dict = Depends(require_admin)):
@@ -4736,7 +4830,7 @@ async def sa_confirm_email_change(
         otp_row = await conn.fetchrow(
             "SELECT id, payload FROM otps"
             " WHERE email=$1 AND otp_hash=$2 AND purpose='sa_email_change'"
-            "   AND used=FALSE AND expires_at > NOW()"
+            "   AND used=FALSE AND expires_at > timezone('utc', now())"
             " ORDER BY created_at DESC LIMIT 1",
             body.new_email, otp_hash,
         )
@@ -5239,14 +5333,19 @@ async def sa_change_ticket_priority(
         raise HTTPException(status_code=400, detail="Invalid priority")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        res = await conn.execute(
+        ticket = await conn.fetchrow("SELECT status, tenant_id FROM tickets WHERE id=$1", ticket_id)
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        
+        if ticket["status"] in ("solved", "closed"):
+            raise HTTPException(status_code=400, detail=f"Cannot change priority of a {ticket['status']} ticket")
+            
+        await conn.execute(
             "UPDATE tickets SET priority=$1, updated_at=NOW() WHERE id=$2",
             body.priority, ticket_id,
         )
-        if res == "UPDATE 0":
-            raise HTTPException(status_code=404, detail="Ticket not found")
         await _audit(conn, current, "change_priority", "ticket", ticket_id,
-                     {"priority": body.priority})
+                     {"priority": body.priority}, tenant_id=ticket["tenant_id"])
     return {"status": "updated", "priority": body.priority}
 
 # ── Platform settings ──────────────────────────────────────────────────────────

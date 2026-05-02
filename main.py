@@ -250,7 +250,7 @@ async def _check_expired_trials():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Winssoft BMA starting…")
+    logger.info("🚀 LeadsAI Backend starting…")
 
     # ── Security startup checks ───────────────────────────────────────────
     _secret = os.environ.get("SECRET_KEY", "change-me")

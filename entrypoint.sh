@@ -2,7 +2,7 @@
 set -e
 
 echo "Downloading .env from S3..."
-aws s3 cp s3://winssoft-leadsai-kms/ma-b/.env /app/.env
+aws s3 cp s3://winssoft-leadsai/ma-b/.env /app/.env
 
 echo "Loading environment variables..."
 export $(grep -v '^#' /app/.env | grep '=' | xargs)

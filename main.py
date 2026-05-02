@@ -851,21 +851,51 @@ def _build_where(filters: list[tuple[Any, str]]) -> tuple[str, list]:
 # PUBLIC
 # ═════════════════════════════════════════════════════════════════════════════
 
+from datetime import datetime, timezone
+from fastapi import HTTPException, status
+
 @app.get("/health", tags=["System"])
 async def health():
     pool = await get_pool()
+    
+    # 1. Check AI Backend via Proxy
+    try:
+        ai_backend_data = await app.state.ai.Check_Health()
+        ai_ok = ai_backend_data.get("status") == "ok"
+    except Exception:
+        ai_ok = False
+
+    # 2. Check Database Connection
     try:
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         db_ok = True
     except Exception:
         db_ok = False
-    return {
-        "status":    "ok" if db_ok else "degraded",
-        "db":        "ok" if db_ok else "error",
+
+    # 3. Determine overall status
+    # If DB or AI is down, we return a non-200 status code 
+    # so the AWS Load Balancer knows the task is "Unhealthy"
+    overall_status = "ok" if (db_ok and ai_ok) else "degraded"
+    
+    response_data = {
+        "status":    overall_status,
+        "database":  "ok" if db_ok else "error",
+        "ai_proxy":  "ok" if ai_ok else "error",
         "version":   "3.1.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    if overall_status == "degraded":
+        # Returning a 503 triggers the AWS ALB to stop sending traffic to this task
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+            detail=response_data
+        )
+
+    return response_data
+
+    
 @app.get("/favicon.ico")
 async def favicon():
     return FileResponse("favicon.ico")

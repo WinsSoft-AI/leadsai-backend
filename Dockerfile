@@ -22,7 +22,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py auth.py db_init.py models.py payments.py lead_manager.py ai_proxy.py s3.py ./
+COPY main.py auth.py db.py db_init.py models.py payments.py lead_manager.py ai_proxy.py s3.py ./
 COPY favicon.ico ./
 COPY widget/ ./widget/
 

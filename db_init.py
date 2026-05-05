@@ -607,15 +607,17 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
                     await conn.execute(f'DROP SCHEMA IF EXISTS "{row["schema_name"]}" CASCADE')
                 logger.info(f"  Dropped {len(schemas)} tenant schema(s)")
 
-                # Drop all public tables dynamically
+                # Drop all leadsai tables dynamically
                 pub_tables = await conn.fetch(
-                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'leadsai'"
                 )
                 for pt in pub_tables:
                     await conn.execute(f'DROP TABLE IF EXISTS "{pt["tablename"]}" CASCADE')
                 logger.info("  All public tables dropped")
 
-            # ── Create public schema tables ──────────────────────────────
+            # ── Create leadsai schema tables ──────────────────────────────
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS leadsai")
+            await conn.execute("SET search_path TO leadsai")
             for stmt in _PUBLIC_TABLES:
                 await conn.execute(stmt)
             for stmt in _PUBLIC_INDEXES:
@@ -623,14 +625,14 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
 
             # ── Create 'tenant' template schema ──────────────────────────
             await conn.execute("CREATE SCHEMA IF NOT EXISTS tenant")
-            await conn.execute("SET search_path TO tenant, public")
+            await conn.execute("SET search_path TO tenant, leadsai")
             try:
                 for stmt in _TENANT_TABLES:
                     await conn.execute(stmt)
                 for idx in _TENANT_INDEXES:
                     await conn.execute(idx)
             finally:
-                await conn.execute("SET search_path TO public")
+                await conn.execute("SET search_path TO leadsai")
             logger.info("  ✅ Template schema 'tenant' created")
 
             # ── Migrate existing tenants: expand languages default ─────────
@@ -655,9 +657,9 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'leadsai' ORDER BY tablename"
         )
-        logger.info(f"📋 Public tables ({len(rows)}): {', '.join(r['tablename'] for r in rows)}")
+        logger.info(f"📋 Platform tables ({len(rows)}): {', '.join(r['tablename'] for r in rows)}")
         schemas = await conn.fetch(
             "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 't_%'"
         )
@@ -723,7 +725,7 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                 " ON CONFLICT (key) DO NOTHING",
                 settings_defaults,
             )
-
+                
             # ── superadmin ────────────────────────────────────────────────────
             sa_email = "superadmin@winssoft.com"
             if not await conn.fetchrow("SELECT id FROM admin_users WHERE email=$1", sa_email):
@@ -746,116 +748,118 @@ async def _seed(pool: asyncpg.Pool, create_tenant_schema) -> None:
                 )
                 logger.info("  ✅ admin@winssoft.com / Admin123!")
 
-            # ── demo tenant (Pro) ─────────────────────────────────────────────
-            demo_email = "demo@winssoft.com"
-            demo_row = await conn.fetchrow(
-                "SELECT id FROM tenants WHERE email=$1", demo_email
-            )
-            if demo_row:
-                logger.info(f"  ℹ  Demo tenant exists (id={demo_row['id']})")
-            else:
-                tid  = secrets.token_hex(8)
-                now  = datetime.now(timezone.utc)
-                end  = now + timedelta(days=30)
 
-                await conn.execute(
-                    "INSERT INTO tenants"
-                    " (id,name,email,company,domain,plan,status,ticket_limit)"
-                    " VALUES ($1,'Demo Store',$2,'Demo Company','localhost','pro','active',10)",
-                    tid, demo_email,
+            if (os.getenv("DEV_MODE", "false").lower() == "true"):
+                # ── demo tenant (Pro) ─────────────────────────────────────────────
+                demo_email = "demo@winssoft.com"
+                demo_row = await conn.fetchrow(
+                    "SELECT id FROM tenants WHERE email=$1", demo_email
                 )
+                if demo_row:
+                    logger.info(f"  ℹ  Demo tenant exists (id={demo_row['id']})")
+                else:
+                    tid  = secrets.token_hex(8)
+                    now  = datetime.now(timezone.utc)
+                    end  = now + timedelta(days=30)
 
-                sub = secrets.token_hex(8)
-                await conn.execute(
-                    "INSERT INTO subscriptions"
-                    " (id,tenant_id,plan,status,amount_rupee,"
-                    "  current_period_start,current_period_end)"
-                    " VALUES ($1,$2,'pro','active',7900,$3,$4)",
-                    sub, tid, now, end,
-                )
+                    await conn.execute(
+                        "INSERT INTO tenants"
+                        " (id,name,email,company,domain,plan,status,ticket_limit)"
+                        " VALUES ($1,'Demo Store',$2,'Demo Company','localhost','pro','active',10)",
+                        tid, demo_email,
+                    )
+
+                    sub = secrets.token_hex(8)
+                    await conn.execute(
+                        "INSERT INTO subscriptions"
+                        " (id,tenant_id,plan,status,amount_rupee,"
+                        "  current_period_start,current_period_end)"
+                        " VALUES ($1,$2,'pro','active',7900,$3,$4)",
+                        sub, tid, now, end,
+                    )
+                    
+                    # Create tenant schema and insert widget_configs there
+                    await create_tenant_schema(conn, tid)
+                    await conn.execute(
+                        f'INSERT INTO "t_{tid}".widget_configs'
+                        " (tenant_id,name,greeting,notification_email)"
+                        " VALUES ($1,'Demo Store',$2,$3)",
+                        tid,
+                        "Hi! I'm your AI assistant. How can I help?",
+                        demo_email,
+                    )
+
+                    # tenant_stats row
+                    await conn.execute(
+                        "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
+                        " ON CONFLICT (tenant_id) DO NOTHING", tid
+                    )
+
+                    ua = secrets.token_hex(8)
+                    await conn.execute(
+                        "INSERT INTO user_auth"
+                        " (id,tenant_id,name,email,password_hash,role)"
+                        " VALUES ($1,$2,'Demo Owner',$3,$4,'owner')",
+                        ua, tid, demo_email, hash_password("Demo123!"),
+                    )
+
+                    logger.info("  ✅ demo@winssoft.com / Demo123!  (Pro plan)")
+
+                # ── starter test client ───────────────────────────────────────────
+                st_email = "test@shop.com"
+                if not await conn.fetchrow("SELECT id FROM tenants WHERE email=$1", st_email):
+                    st  = secrets.token_hex(8)
+                    now2 = datetime.now(timezone.utc)
+                    await conn.execute(
+                        "INSERT INTO tenants"
+                        " (id,name,email,company,plan,status,ticket_limit)"
+                        " VALUES ($1,'Test Shop',$2,'Test Ltd','starter','active',2)",
+                        st, st_email,
+                    )
+                    # Create tenant schema and insert widget_configs
+                    await create_tenant_schema(conn, st)
+                    await conn.execute(
+                        f'INSERT INTO "t_{st}".widget_configs (tenant_id,name,notification_email)'
+                        " VALUES ($1,'Test Shop',$2)",
+                        st, st_email,
+                    )
+                    await conn.execute(
+                        "INSERT INTO subscriptions"
+                        " (id,tenant_id,plan,status,amount_rupee,"
+                        "  current_period_start,current_period_end)"
+                        " VALUES ($1,$2,'starter','active',2900,$3,$4)",
+                        secrets.token_hex(8), st, now2, now2 + timedelta(days=30),
+                    )
+                    await conn.execute(
+                        "INSERT INTO user_auth"
+                        " (id,tenant_id,name,email,password_hash,role)"
+                        " VALUES ($1,$2,'Shop Owner',$3,$4,'owner')",
+                        secrets.token_hex(8), st, st_email, hash_password("Test123!"),
+                    )
+                    
+                    # tenant_stats row
+                    await conn.execute(
+                        "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
+                        " ON CONFLICT (tenant_id) DO NOTHING", st
+                    )
+                    logger.info("  ✅ test@shop.com / Test123!  (Starter plan)")
                 
-                # Create tenant schema and insert widget_configs there
-                await create_tenant_schema(conn, tid)
-                await conn.execute(
-                    f'INSERT INTO "t_{tid}".widget_configs'
-                    " (tenant_id,name,greeting,notification_email)"
-                    " VALUES ($1,'Demo Store',$2,$3)",
-                    tid,
-                    "Hi! I'm your AI assistant. How can I help?",
-                    demo_email,
-                )
-
-                # tenant_stats row
-                await conn.execute(
-                    "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
-                    " ON CONFLICT (tenant_id) DO NOTHING", tid
-                )
-
-                ua = secrets.token_hex(8)
-                await conn.execute(
-                    "INSERT INTO user_auth"
-                    " (id,tenant_id,name,email,password_hash,role)"
-                    " VALUES ($1,$2,'Demo Owner',$3,$4,'owner')",
-                    ua, tid, demo_email, hash_password("Demo123!"),
-                )
-
-                logger.info("  ✅ demo@winssoft.com / Demo123!  (Pro plan)")
-
-            # ── starter test client ───────────────────────────────────────────
-            st_email = "test@shop.com"
-            if not await conn.fetchrow("SELECT id FROM tenants WHERE email=$1", st_email):
-                st  = secrets.token_hex(8)
-                now2 = datetime.now(timezone.utc)
-                await conn.execute(
-                    "INSERT INTO tenants"
-                    " (id,name,email,company,plan,status,ticket_limit)"
-                    " VALUES ($1,'Test Shop',$2,'Test Ltd','starter','active',2)",
-                    st, st_email,
-                )
-                # Create tenant schema and insert widget_configs
-                await create_tenant_schema(conn, st)
-                await conn.execute(
-                    f'INSERT INTO "t_{st}".widget_configs (tenant_id,name,notification_email)'
-                    " VALUES ($1,'Test Shop',$2)",
-                    st, st_email,
-                )
-                await conn.execute(
-                    "INSERT INTO subscriptions"
-                    " (id,tenant_id,plan,status,amount_rupee,"
-                    "  current_period_start,current_period_end)"
-                    " VALUES ($1,$2,'starter','active',2900,$3,$4)",
-                    secrets.token_hex(8), st, now2, now2 + timedelta(days=30),
-                )
-                await conn.execute(
-                    "INSERT INTO user_auth"
-                    " (id,tenant_id,name,email,password_hash,role)"
-                    " VALUES ($1,$2,'Shop Owner',$3,$4,'owner')",
-                    secrets.token_hex(8), st, st_email, hash_password("Test123!"),
-                )
-                
-                # tenant_stats row
-                await conn.execute(
-                    "INSERT INTO tenant_stats (tenant_id) VALUES ($1)"
-                    " ON CONFLICT (tenant_id) DO NOTHING", st
-                )
-                logger.info("  ✅ test@shop.com / Test123!  (Starter plan)")
-            
-            # ── test ticket with attachment ──────────────────────────────────
-            test_tid = await conn.fetchval("SELECT id FROM tenants WHERE email='test@shop.com'")
-            if test_tid:
-                t_id = secrets.token_hex(8)
-                await conn.execute(
-                    "INSERT INTO tickets (id, tenant_id, user_id, heading, context, priority, status)"
-                    " VALUES ($1, $2, (SELECT id FROM user_auth WHERE tenant_id=$2 LIMIT 1),"
-                    " 'Testing attachment', 'This ticket has an attachment for verification.', 'high', 'open')",
-                    t_id, test_tid
-                )
-                await conn.execute(
-                    "INSERT INTO ticket_attachments (id, ticket_id, filename, file_path, mime_type)"
-                    " VALUES ($1, $2, 'test_image.png', 'https://placehold.co/600x400', 'image/png')",
-                    secrets.token_hex(8), t_id
-                )
-                logger.info("  ✅ Created test ticket with attachment")
+                # ── test ticket with attachment ──────────────────────────────────
+                test_tid = await conn.fetchval("SELECT id FROM tenants WHERE email='test@shop.com'")
+                if test_tid:
+                    t_id = secrets.token_hex(8)
+                    await conn.execute(
+                        "INSERT INTO tickets (id, tenant_id, user_id, heading, context, priority, status)"
+                        " VALUES ($1, $2, (SELECT id FROM user_auth WHERE tenant_id=$2 LIMIT 1),"
+                        " 'Testing attachment', 'This ticket has an attachment for verification.', 'high', 'open')",
+                        t_id, test_tid
+                    )
+                    await conn.execute(
+                        "INSERT INTO ticket_attachments (id, ticket_id, filename, file_path, mime_type)"
+                        " VALUES ($1, $2, 'test_image.png', 'https://placehold.co/600x400', 'image/png')",
+                        secrets.token_hex(8), t_id
+                    )
+                    logger.info("  ✅ Created test ticket with attachment")
 
     logger.info("✅ Seed complete")
 

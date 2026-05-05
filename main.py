@@ -185,15 +185,8 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
 # ── Directory setup ────────────────────────────────────────────────────────────
-
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 WIDGET_DIR = Path(__file__).parent / "widget"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
-PRODUCT_UPLOAD_DIR = UPLOAD_DIR / "products"
-PRODUCT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-LOGO_UPLOAD_DIR = UPLOAD_DIR / "logos"
-LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # BACKGROUND TASK — Auto-suspend expired trial tenants
@@ -350,8 +343,6 @@ app.add_middleware(DynamicCORSMiddleware, static_origins=allowed_origins)
 
 
 app.include_router(auth_router)
-if os.getenv("DEV_MODE", "false").lower() == "true":
-    app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 if WIDGET_DIR.exists():
     app.mount("/widget", StaticFiles(directory=str(WIDGET_DIR)), name="widget")
 

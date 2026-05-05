@@ -42,11 +42,14 @@ except ImportError:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _dsn() -> str:
-    raw = os.environ.get("DATABASE_URL", "")
-    if not raw:
-        logger.error("DATABASE_URL is not set in .env")
-        import sys
-        sys.exit(1)
+    if (os.getenv("DEV_MODE", "false").lower() == "true"):
+        raw = os.getenv("DEV_DB_URL", "")
+    else:
+        raw = os.environ.get("DATABASE_URL", "")
+        if not raw:
+            logger.error("DATABASE_URL is not set in .env")
+            import sys
+            sys.exit(1)
     return raw.replace("postgresql+asyncpg://", "postgresql://") \
                .replace("postgres+asyncpg://",   "postgresql://")
 
@@ -138,11 +141,11 @@ async def tenant_conn(tenant_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         schema = f"t_{tenant_id}"
-        await conn.execute(f'SET search_path TO "{schema}", public')
+        await conn.execute(f'SET search_path TO "{schema}", leadsai')
         try:
             yield conn
         finally:
-            await conn.execute("SET search_path TO public")
+            await conn.execute("SET search_path TO leadsai")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

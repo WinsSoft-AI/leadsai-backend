@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - Dev
 
 jobs:
   build:
@@ -25,8 +26,19 @@ jobs:
         run: |
           # Convert the repository name to lowercase
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE_URL="ghcr.io/${REPO_LOWER}/backend:latest"
+
+          # Get branch name and convert to lowercase (Dev -> dev)
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]')
           
+          # Determine the tag: use "latest" for main, otherwise use branch name
+          if [ "$BRANCH_NAME" = "main" ]; then
+            TAG="latest"
+          else
+            TAG="$BRANCH_NAME"
+          fi
+
+          IMAGE_URL="ghcr.io/${REPO_LOWER}/backend:${TAG}"
+
           echo "Building image: $IMAGE_URL"
           docker build -t $IMAGE_URL .
           

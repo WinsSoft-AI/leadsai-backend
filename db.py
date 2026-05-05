@@ -23,9 +23,12 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import Optional
 
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Robustly load .env from the same directory as this file
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path, override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +47,10 @@ except ImportError:
 def _dsn() -> str:
     if (os.getenv("DEV_MODE", "false").lower() == "true"):
         raw = os.getenv("DEV_DB_URL", "")
+        logger.info("Using Development Database")
     else:
         raw = os.environ.get("DATABASE_URL", "")
+        logger.info("Using Production Database")
         if not raw:
             logger.error("DATABASE_URL is not set in .env")
             import sys

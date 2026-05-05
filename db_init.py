@@ -29,7 +29,6 @@ import asyncio
 
 import logging
 import os
-import secrets
 import sys
 import json
 from datetime import datetime, timedelta, timezone
@@ -613,7 +612,7 @@ async def init_db(reset: bool = False, seed: bool = True) -> None:
                 )
                 for pt in pub_tables:
                     await conn.execute(f'DROP TABLE IF EXISTS "{pt["tablename"]}" CASCADE')
-                logger.info("  All public tables dropped")
+                logger.info("  All leadsai tables dropped")
 
             # ── Create leadsai schema tables ──────────────────────────────
             await conn.execute("CREATE SCHEMA IF NOT EXISTS leadsai")
